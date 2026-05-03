@@ -37,6 +37,15 @@ func TestParseToolCalls(t *testing.T) {
 </|DSML|tool_calls>`,
 			expected: 2,
 		},
+		{
+			name: "Tool call with arguments wrapper",
+			input: `<|DSML|tool_calls>
+<|DSML|invoke name="bash">
+<|DSML|parameter name="arguments"><![CDATA[{"command":"git push origin main","description":"Push to origin main"}]]></|DSML|parameter>
+</|DSML|invoke>
+</|DSML|tool_calls>`,
+			expected: 1,
+		},
 	}
 
 	for _, tt := range tests {
@@ -56,6 +65,20 @@ func TestParseToolCalls(t *testing.T) {
 				// Check that input can be marshaled to JSON
 				if _, err := json.Marshal(calls[0].Input); err != nil {
 					t.Errorf("failed to marshal input: %v", err)
+				}
+				
+				// Special check for arguments wrapper case
+				if tt.name == "Tool call with arguments wrapper" {
+					// Verify that the arguments were unwrapped
+					if _, hasArgsKey := calls[0].Input["arguments"]; hasArgsKey {
+						t.Error("arguments should have been unwrapped, found 'arguments' key in input")
+					}
+					if calls[0].Input["command"] != "git push origin main" {
+						t.Errorf("expected command='git push origin main', got %v", calls[0].Input["command"])
+					}
+					if calls[0].Input["description"] != "Push to origin main" {
+						t.Errorf("expected description='Push to origin main', got %v", calls[0].Input["description"])
+					}
 				}
 			}
 		})

@@ -55,11 +55,30 @@ func parseParameters(body string) map[string]any {
 	paramPattern := regexp.MustCompile(`(?s)<parameter\s+name="([^"]+)"[^>]*>(.*?)</parameter>`)
 	matches := paramPattern.FindAllStringSubmatch(body, -1)
 
+	// Check for special case: single "arguments" parameter containing JSON object
+	// This handles when model wraps all args in {"arguments": {...}} instead of individual params
+	if len(matches) == 1 && matches[0][1] == "arguments" {
+		paramValue := matches[0][2]
+
+		// Strip CDATA if present (]]> not ]]>)
+		paramValue = strings.TrimSpace(paramValue)
+		if strings.HasPrefix(paramValue, "<![CDATA[") && strings.HasSuffix(paramValue, "]]>") {
+			paramValue = paramValue[9 : len(paramValue)-3] // Remove <![CDATA[ and ]]>
+		}
+
+		// Try to parse as JSON object - if successful, return it directly (unwrap)
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(paramValue), &parsed); err == nil {
+			return parsed
+		}
+	}
+
+	// Standard multi-parameter parsing
 	for _, match := range matches {
 		paramName := match[1]
 		paramValue := match[2]
 
-		// Strip CDATA if present
+		// Strip CDATA if present (]]> not ]]>)
 		paramValue = strings.TrimSpace(paramValue)
 		if strings.HasPrefix(paramValue, "<![CDATA[") && strings.HasSuffix(paramValue, "]]>") {
 			paramValue = paramValue[9 : len(paramValue)-3] // Remove <![CDATA[ and ]]>
