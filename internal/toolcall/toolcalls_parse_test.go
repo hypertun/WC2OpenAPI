@@ -46,6 +46,61 @@ func TestParseToolCalls(t *testing.T) {
 </|DSML|tool_calls>`,
 			expected: 1,
 		},
+		{
+			name: "Truncated wrapper - missing closing tag",
+			input: `<|DSML|tool_calls>
+<|DSML|invoke name="bash">
+<|DSML|parameter name="command"><![CDATA[ls -la]]></|DSML|parameter>
+</|DSML|invoke>`,
+			expected: 1,
+		},
+		{
+			name: "Fallback extraction - single quotes",
+			input: `<|DSML|tool_calls>
+<|DSML|invoke name='bash'>
+<|DSML|parameter name='command'><![CDATA[ls -la]]></|DSML|parameter>
+</|DSML|invoke>
+</|DSML|tool_calls>`,
+			expected: 1,
+		},
+		{
+			name: "Fallback extraction - unquoted attributes",
+			input: `<|DSML|tool_calls>
+<|DSML|invoke name=bash>
+<|DSML|parameter name=command><![CDATA[ls -la]]></|DSML|parameter>
+</|DSML|invoke>
+</|DSML|tool_calls>`,
+			expected: 1,
+		},
+		{
+			name: "Fallback extraction - mixed malformed",
+			input: `<|DSML|tool_calls>
+<|DSML|invoke name='bash' type='shell'>
+<|DSML|parameter name="command"><![CDATA[pwd]]></|DSML|parameter>
+</|DSML|invoke>
+<|DSML|invoke name=git>
+<|DSML|parameter name='command'><![CDATA[git status]]></|DSML|parameter>
+</|DSML|invoke>
+</|DSML|tool_calls>`,
+			expected: 2,
+		},
+		{
+			name: "Chunk split - partial invoke without closing tag",
+			input: `<|DSML|tool_calls>
+<|DSML|invoke name="bash">
+<|DSML|parameter name="command"><![CDATA[ls -la]]></|DSML|parameter>`,
+			expected: 1,
+		},
+		{
+			name: "Chunk split - complete invoke followed by partial",
+			input: `<|DSML|tool_calls>
+<|DSML|invoke name="bash">
+<|DSML|parameter name="command"><![CDATA[git status]]></|DSML|parameter>
+</|DSML|invoke>
+<|DSML|invoke name="git">
+<|DSML|parameter name="command"><![CDATA[git log]]></|DSML|parameter>`,
+			expected: 2,
+		},
 	}
 
 	for _, tt := range tests {

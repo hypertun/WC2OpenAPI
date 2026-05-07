@@ -20,7 +20,7 @@ func truncate(s string, maxLen int) string {
 
 // parseToolCallsFromText detects and parses tool calls from DSML markup in text
 // Returns OpenAI-compatible ToolCall objects
-func parseToolCallsFromText(text string) ([]providers.ToolCall, error) {
+func parseToolCallsFromText(text string, tools []providers.Tool) ([]providers.ToolCall, error) {
 	// Check for DSML tool_calls markup
 	if !strings.Contains(text, "<|DSML|tool_calls>") && !strings.Contains(text, "<tool_call>") {
 		return nil, nil // No tool calls found
@@ -42,6 +42,11 @@ func parseToolCallsFromText(text string) ([]providers.ToolCall, error) {
 	for i, call := range parsedCalls {
 		slog.Debug("Parsed tool call", "name", call.Name, "args", call.Input)
 
+		// Validate tool call parameters if tool definitions are available
+		if tools != nil {
+			validateToolCall(call.Name, call.Input, tools)
+		}
+
 		// Convert input to JSON string for OpenAI format
 		argsJSON, err := json.Marshal(call.Input)
 		if err != nil {
@@ -62,4 +67,28 @@ func parseToolCallsFromText(text string) ([]providers.ToolCall, error) {
 	}
 
 	return toolCalls, nil
+}
+
+// validateToolCall validates a tool call against provided tool definitions
+func validateToolCall(name string, input map[string]any, tools []providers.Tool) {
+	// Find matching tool definition
+	for _, t := range tools {
+		if t.Function.Name == name {
+			if t.Function.Parameters != nil {
+				schemaJSON, err := json.Marshal(t.Function.Parameters)
+				if err != nil {
+					slog.Warn("Failed to marshal tool schema", "tool", name, "error", err)
+					return
+				}
+				result := toolcall.ValidateToolCall(name, input, string(schemaJSON))
+				if result.HasErrors() {
+					slog.Warn("Tool call validation failed",
+						"tool", name,
+						"error_count", len(result.Errors),
+						"errors", result.Errors)
+				}
+			}
+			break
+		}
+	}
 }

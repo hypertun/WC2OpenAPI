@@ -67,7 +67,7 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req *providers.ChatRe
 	slog.Debug("Qwen completion response", "body_preview", string(body)[:min(len(body), 500)])
 
 	// Parse SSE content
-	content, toolCalls := parseSSEContent(string(body))
+	content, toolCalls := parseSSEContent(string(body), req.Tools)
 
 	// Build response
 	chatResp := &providers.ChatResponse{
@@ -103,7 +103,7 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req *providers.ChatRe
 }
 
 // parseSSEContent extracts content from SSE response
-func parseSSEContent(sseBody string) (string, []providers.ToolCall) {
+func parseSSEContent(sseBody string, tools []providers.Tool) (string, []providers.ToolCall) {
 	lines := strings.Split(sseBody, "\n")
 	var content strings.Builder
 	var allToolCalls []providers.ToolCall
@@ -149,29 +149,8 @@ func parseSSEContent(sseBody string) (string, []providers.ToolCall) {
 			// Reasoning content - append to content
 			content.WriteString(contentStr)
 		case "tool_call":
-			// Tool call in native format - parse the JSON in content
-			if contentStr != "" {
-				// Try to parse as a tool call
-				var toolData struct {
-					Name  string                 `json:"name"`
-					Input map[string]interface{} `json:"input"`
-				}
-				if err := json.Unmarshal([]byte(contentStr), &toolData); err == nil {
-					argsJSON, _ := json.Marshal(toolData.Input)
-					argsStr := string(argsJSON)
-					tcf := providers.ToolCallFunction{
-						Name:      toolData.Name,
-						Arguments: argsStr,
-					}
-					tcfJSON, _ := json.Marshal(tcf)
-					slog.Debug("ToolCallFunction JSON", "json", string(tcfJSON), "argsType", fmt.Sprintf("%T", argsStr))
-					allToolCalls = append(allToolCalls, providers.ToolCall{
-						ID:   fmt.Sprintf("call_%d", len(allToolCalls)),
-						Type: "function",
-						Function: tcf,
-					})
-				}
-			}
+			// Native tool call - buffer as regular content; tool calls detected via marker parsing on fullText
+			content.WriteString(contentStr)
 		default: // "answer" or empty
 			if contentStr != "" {
 				content.WriteString(contentStr)
@@ -182,7 +161,7 @@ func parseSSEContent(sseBody string) (string, []providers.ToolCall) {
 	fullText := strings.TrimSpace(content.String())
 
 	// Check for ##TOOL_CALL## markers in the full text
-	toolCalls, err := parseToolCallsFromText(fullText)
+	toolCalls, err := parseToolCallsFromText(fullText, tools)
 	if err != nil {
 		slog.Debug("Failed to parse tool calls from text", "error", err)
 	}
@@ -282,8 +261,7 @@ func (c *Client) CreateChatCompletionStream(ctx context.Context, req *providers.
 
 		// Buffer to collect full response for tool call detection
 		var contentBuffer strings.Builder
-		var reasoningBuffer strings.Builder
-		var hasToolCalls bool
+		var sawToolCallPhase bool
 
 		for {
 			line, err := reader.ReadString('\n')
@@ -305,13 +283,65 @@ func (c *Client) CreateChatCompletionStream(ctx context.Context, req *providers.
 				continue
 			}
 
-			data := strings.TrimPrefix(line, "data: ")
-			if data == "[DONE]" {
-				// Stream ended with [DONE] marker
-				fullText := contentBuffer.String()
-				handleStreamEnd(streamChan, msgID, created, req.Model, fullText, &hasToolCalls)
-				return
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			// Stream ended with [DONE] marker
+			fullText := contentBuffer.String()
+			if sawToolCallPhase {
+				toolCalls, err := parseToolCallsFromText(fullText, req.Tools)
+				if err != nil {
+					slog.Debug("Failed to parse tool calls in stream", "error", err, "text", fullText[:min(len(fullText), 300)])
+				}
+				if len(toolCalls) > 0 {
+					streamChan <- providers.StreamResponse{
+						ID:      msgID,
+						Object:  "chat.completion.chunk",
+						Created: created,
+						Model:   req.Model,
+						Choices: []providers.StreamChoice{
+							{
+								Index: 0,
+								Delta: providers.Delta{
+									ToolCalls: toolCalls,
+								},
+								FinishReason: stringPtr("tool_calls"),
+							},
+						},
+					}
+				} else {
+					finishReason := "stop"
+					streamChan <- providers.StreamResponse{
+						ID:      msgID,
+						Object:  "chat.completion.chunk",
+						Created: created,
+						Model:   req.Model,
+						Choices: []providers.StreamChoice{
+							{
+								Index:        0,
+								Delta:        providers.Delta{},
+								FinishReason: &finishReason,
+							},
+						},
+					}
+				}
+			} else {
+				finishReason := "stop"
+				streamChan <- providers.StreamResponse{
+					ID:      msgID,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   req.Model,
+					Choices: []providers.StreamChoice{
+						{
+							Index:        0,
+							Delta:        providers.Delta{},
+							FinishReason: &finishReason,
+						},
+					},
+				}
 			}
+			return
+		}
 
 			// Parse SSE event
 			var evt struct {
@@ -339,12 +369,10 @@ func (c *Client) CreateChatCompletionStream(ctx context.Context, req *providers.
 
 			// Handle different phases
 			switch phase {
-			case "think", "thinking_summary":
-				// Reasoning content - buffer for tool call detection
-				reasoningBuffer.WriteString(contentStr)
-				contentBuffer.WriteString(contentStr)
-				// Send immediately to prevent timeout
-				streamChan <- providers.StreamResponse{
+		case "think", "thinking_summary":
+			// Reasoning content - buffer for tool call detection and stream immediately
+			contentBuffer.WriteString(contentStr)
+			streamChan <- providers.StreamResponse{
 					ID:      msgID,
 					Object:  "chat.completion.chunk",
 					Created: created,
@@ -358,24 +386,10 @@ func (c *Client) CreateChatCompletionStream(ctx context.Context, req *providers.
 						},
 					},
 				}
-			case "tool_call":
-				// Native tool call - buffer for tool call detection
-				contentBuffer.WriteString(contentStr)
-				// Send immediately to prevent timeout
-				streamChan <- providers.StreamResponse{
-					ID:      msgID,
-					Object:  "chat.completion.chunk",
-					Created: created,
-					Model:   req.Model,
-					Choices: []providers.StreamChoice{
-						{
-							Index: 0,
-							Delta: providers.Delta{
-								Content: contentStr,
-							},
-						},
-					},
-				}
+		case "tool_call":
+			// Native tool call - mark phase and buffer for tool call detection only (do not stream to client)
+			sawToolCallPhase = true
+			contentBuffer.WriteString(contentStr)
 			default: // "answer" or empty
 				if contentStr != "" {
 					contentBuffer.WriteString(contentStr)
@@ -398,59 +412,68 @@ func (c *Client) CreateChatCompletionStream(ctx context.Context, req *providers.
 			}
 		}
 
-		// Process buffered content at end of stream
-		fullText := contentBuffer.String()
-		handleStreamEnd(streamChan, msgID, created, req.Model, fullText, &hasToolCalls)
+	// Process buffered content at end of stream (EOF)
+	fullText := contentBuffer.String()
+	slog.Debug("Stream end processing", "sawToolCallPhase", sawToolCallPhase, "buffer_len", len(fullText))
+		if sawToolCallPhase {
+			toolCalls, err := parseToolCallsFromText(fullText, req.Tools)
+			if err != nil {
+				slog.Debug("Failed to parse tool calls in stream", "error", err, "text", fullText[:min(len(fullText), 300)])
+			}
+			if len(toolCalls) > 0 {
+				streamChan <- providers.StreamResponse{
+					ID:      msgID,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   req.Model,
+					Choices: []providers.StreamChoice{
+						{
+							Index: 0,
+							Delta: providers.Delta{
+								ToolCalls: toolCalls,
+							},
+							FinishReason: stringPtr("tool_calls"),
+						},
+					},
+				}
+			} else {
+				finishReason := "stop"
+				streamChan <- providers.StreamResponse{
+					ID:      msgID,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   req.Model,
+					Choices: []providers.StreamChoice{
+						{
+							Index:        0,
+							Delta:        providers.Delta{},
+							FinishReason: &finishReason,
+						},
+					},
+				}
+			}
+		} else {
+			// No tool calls expected; just send finish (content already streamed)
+			finishReason := "stop"
+			streamChan <- providers.StreamResponse{
+				ID:      msgID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   req.Model,
+				Choices: []providers.StreamChoice{
+					{
+						Index:        0,
+						Delta:        providers.Delta{},
+						FinishReason: &finishReason,
+					},
+				},
+			}
+		}
 	}()
 
 	return streamChan, nil
 }
 
-// handleStreamEnd processes the buffered stream content and sends appropriate responses
-func handleStreamEnd(streamChan chan providers.StreamResponse, msgID string, created int64, model string, fullText string, hasToolCalls *bool) {
-	// Check for tool calls in the full response
-	toolCalls, err := parseToolCallsFromText(fullText)
-	if err != nil {
-		slog.Debug("Failed to parse tool calls in stream", "error", err, "text", fullText[:min(len(fullText), 300)])
-	}
-
-	if len(toolCalls) > 0 {
-		*hasToolCalls = true
-		// Send tool calls as a single chunk
-		streamChan <- providers.StreamResponse{
-			ID:      msgID,
-			Object:  "chat.completion.chunk",
-			Created: created,
-			Model:   model,
-			Choices: []providers.StreamChoice{
-				{
-					Index: 0,
-					Delta: providers.Delta{
-						ToolCalls: toolCalls,
-					},
-					FinishReason: stringPtr("tool_calls"),
-				},
-			},
-		}
-	} else {
-		// No tool calls, just send finish message
-		// Content has already been streamed in real-time above
-		finishReason := "stop"
-		streamChan <- providers.StreamResponse{
-			ID:      msgID,
-			Object:  "chat.completion.chunk",
-			Created: created,
-			Model:   model,
-			Choices: []providers.StreamChoice{
-				{
-					Index:        0,
-					Delta:        providers.Delta{},
-					FinishReason: &finishReason,
-				},
-			},
-		}
-	}
-}
 
 // convertRequest converts OpenAI request to Qwen format
 func (c *Client) convertRequest(chatID string, req *providers.ChatRequest) []byte {
@@ -474,6 +497,31 @@ func (c *Client) convertRequest(chatID string, req *providers.ChatRequest) []byt
 
 	// Build Qwen-specific payload (from qwen2api payload_builder.py)
 	timestamp := time.Now().Unix()
+
+	// Determine feature config: base values + low-latency override when tools are present
+	featureConfig := map[string]interface{}{
+		"thinking_enabled":       !isNoThinking,
+		"output_schema":         "phase",
+		"research_mode":         "normal",
+		"auto_thinking":         !isNoThinking,
+		"thinking_mode":         "Auto",
+		"thinking_format":       "summary",
+		"auto_search":           false,
+		"code_interpreter":      false,
+		"plugins_enabled":       false,
+		"function_calling":     false, // Disable native function calling to avoid interception
+		"enable_tools":         false, // Disable native tools
+		"enable_function_call": false, // Disable native function calls
+		"tool_choice":          "none", // Prevent upstream interception
+	}
+
+	// When custom tools are used, match Python's CUSTOM_TOOL_LOW_LATENCY_OVERRIDES:
+	// disable thinking to reduce latency and avoid upstream content filters.
+	if len(req.Tools) > 0 {
+		featureConfig["thinking_enabled"] = false
+		featureConfig["auto_thinking"] = false
+	}
+
 	payload := map[string]interface{}{
 		"stream":            true,
 		"version":           "2.1",
@@ -494,20 +542,7 @@ func (c *Client) convertRequest(chatID string, req *providers.ChatRequest) []byt
 				"timestamp":    timestamp,
 				"models":       []string{model},
 				"chat_type":    "t2t",
-				"feature_config": map[string]interface{}{
-					"thinking_enabled":       !isNoThinking,
-					"output_schema":         "phase",
-					"research_mode":         "normal",
-					"auto_thinking":         !isNoThinking,
-					"thinking_format":       "summary",
-					"auto_search":           false,
-					"code_interpreter":      false,
-					"plugins_enabled":       false,
-					"function_calling":     false, // Disable native function calling
-					"enable_tools":         false, // Disable native tools
-					"enable_function_call": false, // Disable native function calls
-					"tool_choice":          "none",  // Prevent upstream interception
-				},
+				"feature_config": featureConfig,
 				"extra": map[string]interface{}{
 					"meta": map[string]interface{}{
 						"subChatType": "t2t",
@@ -545,12 +580,12 @@ func (c *Client) formatMessagesToPrompt(messages []providers.Message) string {
 			// Handle assistant messages with or without tool calls
 			content := string(msg.Content)
 			if len(msg.ToolCalls) > 0 {
-				// Format tool calls for context
+				// Format tool calls for context (obfuscate tool names)
 				var toolCallParts []string
 				for _, tc := range msg.ToolCalls {
 					toolCallParts = append(toolCallParts, fmt.Sprintf(
 						"##TOOL_CALL##\n{\"name\": \"%s\", \"input\": %s}\n##END_CALL##",
-						tc.Function.Name,
+						toQwenName(tc.Function.Name),
 						tc.Function.Arguments,
 					))
 				}

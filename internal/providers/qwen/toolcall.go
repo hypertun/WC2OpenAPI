@@ -15,24 +15,28 @@ func injectToolPrompt(messages []providers.Message, tools []providers.Tool, tool
 		return messages
 	}
 
-	// Extract tool names for the prompt
+	// Extract and obfuscate tool names for the prompt
 	var toolNames []string
 	for _, tool := range tools {
-		toolNames = append(toolNames, tool.Function.Name)
+		toolNames = append(toolNames, toQwenName(tool.Function.Name))
 	}
 
-	// Build tool schemas section (simplified for Qwen)
+	// Build tool schemas section (names obfuscated)
 	var toolSchemas []string
 	for _, tool := range tools {
 		schema := tool.Function
-		toolSchemas = append(toolSchemas, fmt.Sprintf("- %s: %s", schema.Name, schema.Description))
+		qwenName := toQwenName(schema.Name)
+		toolSchemas = append(toolSchemas, fmt.Sprintf("- %s: %s", qwenName, schema.Description))
 	}
 
-	// Build Qwen tool call instructions using the shared package
+	// Build Qwen tool call instructions using the shared package (names already obfuscated)
 	toolInstruction := toolcall.BuildQwenToolCallInstructions(toolNames)
 
 	// Build the full tool prompt
 	toolPrompt := fmt.Sprintf("You have access to the following tools:\n\n%s\n\n%s", strings.Join(toolSchemas, "\n"), toolInstruction)
+
+	// Obfuscate bare tool name mentions in the instruction text itself
+	toolPrompt = obfuscateBareNames(toolPrompt)
 
 	// Handle tool_choice policy
 	switch tc := toolChoice.(type) {

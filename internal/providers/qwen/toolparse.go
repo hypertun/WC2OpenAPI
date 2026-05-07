@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"strconv"
 	"strings"
 
 	providers "github.com/user/wc2api/internal/providers"
+	"github.com/user/wc2api/internal/toolcall"
 )
 
 // truncate shortens a string for logging
@@ -21,9 +23,24 @@ func truncate(s string, maxLen int) string {
 // parseToolCallsFromText detects and parses tool calls from ##TOOL_CALL## markers in text
 // Follows qwen2API approach with normalization for fragmented tool calls
 // Returns OpenAI-compatible ToolCall objects
-func parseToolCallsFromText(text string) ([]providers.ToolCall, error) {
+func parseToolCallsFromText(text string, tools []providers.Tool) ([]providers.ToolCall, error) {
 	if text == "" {
 		return nil, nil
+	}
+
+	// First, try parsing directly from original text (preserves multiple tool calls)
+	// before normalization strips anything
+	if strings.Contains(text, "##TOOL_CALL##") || strings.Contains(text, "##END_CALL##") {
+		if calls := parseToolCallMarkers(text); len(calls) > 0 {
+			slog.Debug("Found tool calls via markers before normalization", "count", len(calls))
+			validateToolCalls(calls, tools)
+			return calls, nil
+		}
+		if calls := parseToolCallFallback(text); len(calls) > 0 {
+			slog.Debug("Found tool calls via fallback before normalization", "count", len(calls))
+			validateToolCalls(calls, tools)
+			return calls, nil
+		}
 	}
 
 	// Normalize fragmented tool calls (following qwen2API _normalize_fragmented_tool_call)
@@ -40,6 +57,7 @@ func parseToolCallsFromText(text string) ([]providers.ToolCall, error) {
 	toolCalls := parseToolCallMarkers(normalizedText)
 	if len(toolCalls) > 0 {
 		slog.Debug("Found tool calls via markers", "count", len(toolCalls))
+		validateToolCalls(toolCalls, tools)
 		return toolCalls, nil
 	}
 
@@ -47,6 +65,7 @@ func parseToolCallsFromText(text string) ([]providers.ToolCall, error) {
 	toolCalls = parseToolCallFallback(normalizedText)
 	if len(toolCalls) > 0 {
 		slog.Debug("Found tool calls via fallback", "count", len(toolCalls))
+		validateToolCalls(toolCalls, tools)
 		return toolCalls, nil
 	}
 
@@ -107,10 +126,20 @@ func normalizeFragmentedToolCall(text string) string {
 
 	normalized := strings.Join(lines, "\n")
 
-	// Fix common marker issues
+	// Fix common marker typos (normalize BEFORE checking for markers)
+	// Missing leading ##
 	if strings.Contains(normalized, "TOOL_CALL##") && !strings.Contains(normalized, "##TOOL_CALL##") {
 		normalized = strings.ReplaceAll(normalized, "TOOL_CALL##", "##TOOL_CALL##")
 	}
+	// Missing trailing #
+	if strings.Contains(normalized, "##END_CALL") && !strings.Contains(normalized, "##END_CALL##") {
+		normalized = strings.ReplaceAll(normalized, "##END_CALL", "##END_CALL##")
+	}
+	// Fix ##END CALL## (space instead of underscore)
+	if strings.Contains(normalized, "##END CALL##") {
+		normalized = strings.ReplaceAll(normalized, "##END CALL##", "##END_CALL##")
+	}
+	// Ensure balanced markers
 	if strings.Contains(normalized, "##END_CALL##") && !strings.Contains(normalized, "##TOOL_CALL##") && strings.Contains(normalized, `"name"`) {
 		normalized = "##TOOL_CALL##\n" + normalized
 	}
@@ -216,8 +245,9 @@ func extractFirstJSONToolCall(text string) string {
 func parseToolCallMarkers(text string) []providers.ToolCall {
 	var calls []providers.ToolCall
 
-	// Pattern: ##TOOL_CALL##\n{json}\n##END_CALL##
-	markerPattern := regexp.MustCompile(`(?s)##TOOL_CALL##\s*\n(.*?)\n\s*##END_CALL##`)
+	// Pattern: ##TOOL_CALL## [content] ##END_CALL## (newlines optional)
+	// Captures any content between markers, supports single-line and multi-line formats
+	markerPattern := regexp.MustCompile(`(?s)##TOOL_CALL##\s*(.+?)\s*##END_CALL##`)
 	matches := markerPattern.FindAllStringSubmatch(text, -1)
 
 	for i, match := range matches {
@@ -252,7 +282,7 @@ func parseToolCallMarkers(text string) []providers.ToolCall {
 			ID:   fmt.Sprintf("call_%d", i),
 			Type: "function",
 			Function: providers.ToolCallFunction{
-				Name:      toolData.Name,
+				Name:      fromQwenName(toolData.Name),
 				Arguments: string(argsJSON),
 			},
 		})
@@ -291,7 +321,7 @@ func parseToolCallFallback(text string) []providers.ToolCall {
 			ID:   fmt.Sprintf("call_%d", i),
 			Type: "function",
 			Function: providers.ToolCallFunction{
-				Name:      toolData.Name,
+				Name:      fromQwenName(toolData.Name),
 				Arguments: string(argsJSON),
 			},
 		})
@@ -337,7 +367,7 @@ func parseToolCallFallback(text string) []providers.ToolCall {
 					ID:   fmt.Sprintf("call_%d", i),
 					Type: "function",
 					Function: providers.ToolCallFunction{
-						Name:      name,
+						Name:      fromQwenName(name),
 						Arguments: string(argsJSON),
 					},
 				})
@@ -378,7 +408,7 @@ func parseNativeToolCalls(text string) []providers.ToolCall {
 				ID:   toolData.ID,
 				Type: "function",
 				Function: providers.ToolCallFunction{
-					Name:      toolData.Name,
+					Name:      fromQwenName(toolData.Name),
 					Arguments: string(argsJSON),
 				},
 			})
@@ -390,6 +420,7 @@ func parseNativeToolCalls(text string) []providers.ToolCall {
 
 // fixToolCallArguments fixes tool call arguments for specific tools
 // Following qwen2API fix_tool_call_arguments approach
+// Enhanced with type coercion, parameter name mapping, default values, and structure fixes
 func fixToolCallArguments(name string, input map[string]interface{}) map[string]interface{} {
 	if input == nil {
 		return input
@@ -400,14 +431,73 @@ func fixToolCallArguments(name string, input map[string]interface{}) map[string]
 		fixed[k] = v
 	}
 
-	// Fix AskUserQuestion tool parameters
-	if name == "AskUserQuestion" {
+	// Step 1: Type coercion for all values (string↔number, boolean variations)
+	for k, v := range fixed {
+		fixed[k] = coerceValue(v)
+	}
+
+	// Step 2: Tool-specific fixes
+	fixed = applyToolSpecificFixes(name, fixed)
+
+	// Step 3: Array/object structure corrections
+	fixed = fixStructures(name, fixed)
+
+	return fixed
+}
+
+// coerceValue attempts to coerce a value to more appropriate types
+func coerceValue(v interface{}) interface{} {
+	if v == nil {
+		return nil
+	}
+	switch val := v.(type) {
+	case string:
+		if val == "" {
+			return val
+		}
+		switch strings.ToLower(val) {
+		case "true", "yes", "y":
+			return true
+		case "false", "no", "n":
+			return false
+		}
+		if i, err := strconv.ParseInt(val, 10, 64); err == nil {
+			return float64(i)
+		}
+		if f, err := strconv.ParseFloat(val, 64); err == nil {
+			return f
+		}
+		return val
+	case bool:
+		return v
+	case float64:
+		return v
+	case []interface{}:
+		for i, item := range val {
+			val[i] = coerceValue(item)
+		}
+		return val
+	case map[string]interface{}:
+		for k, item := range val {
+			val[k] = coerceValue(item)
+		}
+		return val
+	default:
+		return v
+	}
+}
+
+// applyToolSpecificFixes applies per-tool parameter name mappings, defaults, and structure fixes
+func applyToolSpecificFixes(name string, fixed map[string]interface{}) map[string]interface{} {
+	switch name {
+	case "AskUserQuestion":
+		// Map singular 'question' to 'questions' array
 		if question, ok := fixed["question"]; ok && fixed["questions"] == nil {
 			fixed["questions"] = []interface{}{
 				map[string]interface{}{
 					"question":    question,
 					"header":      "Question",
-					"options":     []interface{}{
+					"options": []interface{}{
 						map[string]interface{}{"label": "Yes", "description": "Confirm"},
 						map[string]interface{}{"label": "No", "description": "Decline"},
 					},
@@ -417,10 +507,21 @@ func fixToolCallArguments(name string, input map[string]interface{}) map[string]
 			delete(fixed, "question")
 			slog.Debug("Fixed AskUserQuestion: converted 'question' to 'questions' array")
 		}
-	}
+		// Ensure each question has a header
+		if questions, ok := fixed["questions"].([]interface{}); ok {
+			for _, q := range questions {
+				if qm, ok := q.(map[string]interface{}); ok {
+					if qm["header"] == nil {
+						qm["header"] = "Question"
+					}
+					if qm["multiSelect"] == nil {
+						qm["multiSelect"] = false
+					}
+				}
+			}
+		}
 
-	// Fix Read tool parameters
-	if name == "Read" {
+	case "Read":
 		if path, ok := fixed["path"]; ok {
 			fixed["file_path"] = path
 			delete(fixed, "path")
@@ -429,10 +530,8 @@ func fixToolCallArguments(name string, input map[string]interface{}) map[string]
 			fixed["file_path"] = filename
 			delete(fixed, "filename")
 		}
-	}
 
-	// Fix Bash tool parameters
-	if name == "Bash" {
+	case "Bash":
 		if cmd, ok := fixed["cmd"]; ok {
 			fixed["command"] = cmd
 			delete(fixed, "cmd")
@@ -441,17 +540,143 @@ func fixToolCallArguments(name string, input map[string]interface{}) map[string]
 			fixed["command"] = script
 			delete(fixed, "script")
 		}
-	}
+		if fixed["timeout"] == nil {
+			fixed["timeout"] = float64(30000)
+			slog.Debug("Fixed Bash: added default timeout 30000ms")
+		}
 
-	// Fix Agent tool parameters
-	if name == "Agent" {
+	case "Agent":
 		if fixed["description"] == nil {
 			fixed["description"] = "Execute sub-task"
 		}
 		if fixed["prompt"] == nil {
 			fixed["prompt"] = fixed["description"]
 		}
+
+	case "Write":
+		if path, ok := fixed["path"]; ok && fixed["file_path"] == nil {
+			fixed["file_path"] = path
+			delete(fixed, "path")
+		}
+		if text, ok := fixed["text"]; ok && fixed["content"] == nil {
+			fixed["content"] = text
+			delete(fixed, "text")
+		}
+
+	case "Edit":
+		if path, ok := fixed["path"]; ok && fixed["file_path"] == nil {
+			fixed["file_path"] = path
+			delete(fixed, "path")
+		}
+		if oldStr, ok := fixed["old"]; ok && fixed["old_string"] == nil {
+			fixed["old_string"] = oldStr
+			delete(fixed, "old")
+		}
+		if newStr, ok := fixed["new"]; ok && fixed["new_string"] == nil {
+			fixed["new_string"] = newStr
+			delete(fixed, "new")
+		}
+
+	case "Search", "Glob":
+		if pattern, ok := fixed["pattern"]; ok && fixed["query"] == nil {
+			fixed["query"] = pattern
+		}
+		if query, ok := fixed["query"]; ok && fixed["pattern"] == nil {
+			fixed["pattern"] = query
+		}
 	}
 
 	return fixed
+}
+
+// fixStructures corrects array/object structure issues in tool call parameters
+func fixStructures(name string, input map[string]interface{}) map[string]interface{} {
+	for k, v := range input {
+		// Wrap scalar values in arrays for known array parameters
+		if _, isArray := v.([]interface{}); !isArray {
+			arrayParams := map[string]bool{
+				"questions": true,
+				"options":   true,
+				"files":     true,
+				"items":     true,
+			}
+			if arrayParams[k] {
+				input[k] = []interface{}{v}
+				slog.Debug("Wrapped value in array for structure fix", "tool", name, "param", k)
+			}
+		}
+
+		// Parse JSON string to object if it starts with '{'
+		if strVal, ok := v.(string); ok && strings.HasPrefix(strVal, "{") {
+			var parsed map[string]interface{}
+			if err := json.Unmarshal([]byte(strVal), &parsed); err == nil {
+				input[k] = parsed
+				slog.Debug("Parsed JSON string to object", "tool", name, "param", k)
+			}
+		}
+
+		// Parse JSON string to array if it starts with '['
+		if strVal, ok := v.(string); ok && strings.HasPrefix(strVal, "[") {
+			var parsed []interface{}
+			if err := json.Unmarshal([]byte(strVal), &parsed); err == nil {
+				input[k] = parsed
+				slog.Debug("Parsed JSON string to array", "tool", name, "param", k)
+			}
+		}
+	}
+	return input
+}
+
+// validateToolCalls validates all tool calls against provided tool definitions
+func validateToolCalls(calls []providers.ToolCall, tools []providers.Tool) {
+	if tools == nil {
+		return
+	}
+	for _, call := range calls {
+		// Unmarshal arguments JSON to map for validation
+		var args map[string]interface{}
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
+			slog.Debug("Failed to unmarshal tool call arguments for validation",
+				"tool", call.Function.Name,
+				"error", err,
+				"arguments", call.Function.Arguments)
+			continue
+		}
+		validateSingleToolCall(call.Function.Name, args, tools)
+	}
+}
+
+// validateSingleToolCall validates a single tool call
+func validateSingleToolCall(name string, input map[string]any, tools []providers.Tool) {
+	// Find the matching tool definition
+	var toolDef *providers.Tool
+	for _, t := range tools {
+		if t.Function.Name == name {
+			toolDef = &t
+			break
+		}
+	}
+	if toolDef == nil {
+		// Tool not found in definitions - this may be handled by error feedback later
+		return
+	}
+
+	// Convert Parameters map to JSON string for validator
+	if toolDef.Function.Parameters == nil {
+		return
+	}
+	schemaJSON, err := json.Marshal(toolDef.Function.Parameters)
+	if err != nil {
+		slog.Warn("Failed to marshal tool schema", "tool", name, "error", err)
+		return
+	}
+
+	// Validate
+	result := toolcall.ValidateToolCall(name, input, string(schemaJSON))
+	if result.HasErrors() {
+		slog.Warn("Tool call validation failed",
+			"tool", name,
+			"error_count", len(result.Errors),
+			"errors", result.Errors)
+	}
 }

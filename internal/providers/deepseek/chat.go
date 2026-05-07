@@ -52,7 +52,7 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req *providers.ChatRe
 	slog.Debug("DeepSeek completion response", "body", string(body))
 
 	// Parse SSE response (DeepSeek returns SSE format even for non-streaming requests)
-	content, toolCalls := parseSSEContent(string(body))
+	content, toolCalls := parseSSEContent(string(body), req.Tools)
 
 	// Build response
 	chatResp := &providers.ChatResponse{
@@ -89,7 +89,7 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req *providers.ChatRe
 
 // parseSSEContent extracts content from SSE response using proper JSON parsing
 // Also detects tool calls in the response
-func parseSSEContent(sseBody string) (string, []providers.ToolCall) {
+func parseSSEContent(sseBody string, tools []providers.Tool) (string, []providers.ToolCall) {
 	lines := strings.Split(sseBody, "\n")
 	var content strings.Builder
 
@@ -147,7 +147,7 @@ func parseSSEContent(sseBody string) (string, []providers.ToolCall) {
 	fullText := strings.TrimSpace(content.String())
 
 	// Check for tool calls in the response
-	toolCalls, err := parseToolCallsFromText(fullText)
+	toolCalls, err := parseToolCallsFromText(fullText, tools)
 	if err != nil {
 		slog.Debug("Failed to parse tool calls", "error", err, "text", fullText)
 	}
@@ -255,7 +255,7 @@ func (c *Client) CreateChatCompletionStream(ctx context.Context, req *providers.
 			if data == "[DONE]" {
 				// Stream ended with [DONE] marker
 				fullText := contentBuffer.String()
-				handleStreamEnd(streamChan, msgID, created, req.Model, fullText, allChunks)
+				handleStreamEnd(streamChan, msgID, created, req.Model, fullText, allChunks, req.Tools)
 				return
 			}
 
@@ -311,7 +311,7 @@ func (c *Client) CreateChatCompletionStream(ctx context.Context, req *providers.
 				"buffered_chunks", len(allChunks),
 				"buffered_length", len(fullText))
 		}
-		handleStreamEnd(streamChan, msgID, created, req.Model, fullText, allChunks)
+		handleStreamEnd(streamChan, msgID, created, req.Model, fullText, allChunks, req.Tools)
 	}()
 	return streamChan, nil
 }
@@ -412,9 +412,9 @@ type deepseekMessage struct {
 }
 
 // handleStreamEnd processes the buffered stream content and sends appropriate responses
-func handleStreamEnd(streamChan chan providers.StreamResponse, msgID string, created int64, model string, fullText string, allChunks []string) {
+func handleStreamEnd(streamChan chan providers.StreamResponse, msgID string, created int64, model string, fullText string, allChunks []string, tools []providers.Tool) {
 	// Check for tool calls in the full response
-	toolCalls, err := parseToolCallsFromText(fullText)
+	toolCalls, err := parseToolCallsFromText(fullText, tools)
 	if err != nil {
 		slog.Debug("Failed to parse tool calls in stream", "error", err, "text", fullText)
 	}
