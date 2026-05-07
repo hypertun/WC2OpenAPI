@@ -10,8 +10,16 @@ import (
 	"github.com/user/wc2api/internal/providers"
 )
 
+// ProviderSelector is implemented by the server to route requests to the appropriate provider
+type ProviderSelector interface {
+	// GetProviderByModel returns the provider for the given model name
+	GetProviderByModel(model string) (providers.Provider, bool)
+	// ListModels returns all available models from all providers
+	ListModels() []providers.Model
+}
+
 // ChatCompletions returns a handler for chat completions
-func ChatCompletions(provider providers.Provider) http.HandlerFunc {
+func ChatCompletions(selector ProviderSelector) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Parse request
 		var req providers.ChatRequest
@@ -35,6 +43,13 @@ func ChatCompletions(provider providers.Provider) http.HandlerFunc {
 
 		if len(req.Messages) == 0 {
 			writeError(w, http.StatusBadRequest, "Messages are required")
+			return
+		}
+
+		// Get the appropriate provider for this model
+		provider, ok := selector.GetProviderByModel(req.Model)
+		if !ok {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("Unknown or unavailable model: %s", req.Model))
 			return
 		}
 
@@ -93,12 +108,22 @@ func handleStreaming(w http.ResponseWriter, r *http.Request, provider providers.
 
 	// Stream responses
 	for chunk := range streamChan {
+		// Debug: Check the actual type of Arguments in tool calls
+		for _, choice := range chunk.Choices {
+			for _, tc := range choice.Delta.ToolCalls {
+				slog.Debug("Pre-marshal check", 
+					"name", tc.Function.Name,
+					"argsType", fmt.Sprintf("%T", tc.Function.Arguments),
+					"argsValue", tc.Function.Arguments)
+			}
+		}
+		
 		data, err := json.Marshal(chunk)
 		if err != nil {
 			slog.Error("Failed to marshal chunk", "error", err)
 			continue
 		}
-
+		slog.Debug("Sending chunk", "data", string(data))
 		fmt.Fprintf(w, "data: %s\n\n", string(data))
 		flusher.Flush()
 	}
@@ -119,4 +144,34 @@ func writeError(w http.ResponseWriter, status int, message string) {
 			"code":    status,
 		},
 	})
+}
+
+// ListModels returns a handler for listing models
+func ListModels(selector ProviderSelector) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		models := selector.ListModels()
+
+		response := struct {
+			Object string            `json:"object"`
+			Data   []providers.Model `json:"data"`
+		}{
+			Object: "list",
+			Data:   models,
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+	}
+}
+
+// HealthCheck returns a health check handler
+func HealthCheck() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "ok",
+			"version": "1.0.0",
+		})
+	}
 }

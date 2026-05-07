@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -13,6 +14,7 @@ import (
 	"github.com/user/wc2api/internal/handlers"
 	"github.com/user/wc2api/internal/providers"
 	"github.com/user/wc2api/internal/providers/deepseek"
+	"github.com/user/wc2api/internal/providers/qwen"
 	serverMiddleware "github.com/user/wc2api/internal/server/middleware"
 )
 
@@ -21,24 +23,48 @@ type Server struct {
 	config     *config.Config
 	router     *chi.Mux
 	httpServer *http.Server
-	provider   providers.Provider
+	providers  []providers.Provider
+	routeTo    func(model string) (providers.Provider, bool)
 }
 
 // New creates a new server instance
 func New(cfg *config.Config) (*Server, error) {
 	s := &Server{
-		config: cfg,
-		router: chi.NewRouter(),
+		config:   cfg,
+		router:   chi.NewRouter(),
+		providers: []providers.Provider{},
 	}
 
-	// Initialize provider
+	// Initialize providers
+	errors := []error{}
+
 	if cfg.Provider.DeepSeek.Enabled {
 		prov, err := deepseek.New(cfg.Provider.DeepSeek)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create deepseek provider: %w", err)
+			errors = append(errors, fmt.Errorf("failed to create deepseek provider: %w", err))
+		} else {
+			s.providers = append(s.providers, prov)
 		}
-		s.provider = prov
 	}
+
+	if cfg.Provider.Qwen.Enabled {
+		prov, err := qwen.New(cfg.Provider.Qwen)
+		if err != nil {
+			errors = append(errors, fmt.Errorf("failed to create qwen provider: %w", err))
+		} else {
+			s.providers = append(s.providers, prov)
+		}
+	}
+
+	if len(s.providers) == 0 {
+		if len(errors) > 0 {
+			return nil, fmt.Errorf("no providers available: %v", errors)
+		}
+		return nil, fmt.Errorf("no providers enabled - enable at least one provider in config")
+	}
+
+	// Setup routing function
+	s.routeTo = s.createRouter()
 
 	s.setupMiddleware()
 	s.setupRoutes()
@@ -51,6 +77,53 @@ func New(cfg *config.Config) (*Server, error) {
 	}
 
 	return s, nil
+}
+
+// createRouter creates a function that routes model names to providers
+func (s *Server) createRouter() func(model string) (providers.Provider, bool) {
+	// Build prefix map
+	prefixToProvider := make(map[string]providers.Provider)
+	for _, p := range s.providers {
+		name := strings.ToLower(p.Name())
+		prefixToProvider[name] = p
+	}
+
+	return func(model string) (providers.Provider, bool) {
+		model = strings.ToLower(model)
+		
+		// Check prefixes
+		for prefix, prov := range prefixToProvider {
+			if strings.HasPrefix(model, prefix+"-") || model == prefix {
+				return prov, true
+			}
+		}
+
+		// Default: use first available provider
+		if len(s.providers) > 0 {
+			return s.providers[0], true
+		}
+
+		return nil, false
+	}
+}
+
+// getAllModels aggregates models from all providers
+func (s *Server) getAllModels() []providers.Model {
+	allModels := []providers.Model{}
+	for _, p := range s.providers {
+		allModels = append(allModels, p.ListModels()...)
+	}
+	return allModels
+}
+
+// GetProviderByModel implements handlers.ProviderSelector
+func (s *Server) GetProviderByModel(model string) (providers.Provider, bool) {
+	return s.routeTo(model)
+}
+
+// ListModels implements handlers.ProviderSelector
+func (s *Server) ListModels() []providers.Model {
+	return s.getAllModels()
 }
 
 // setupMiddleware configures all middleware
@@ -78,8 +151,8 @@ func (s *Server) setupRoutes() {
 		r.Use(serverMiddleware.Auth(s.config.Auth.APIKeys))
 
 		// OpenAI compatible endpoints
-		r.Get("/models", handlers.ListModels(s.provider))
-		r.Post("/chat/completions", handlers.ChatCompletions(s.provider))
+		r.Get("/models", handlers.ListModels(s))
+		r.Post("/chat/completions", handlers.ChatCompletions(s))
 	})
 }
 

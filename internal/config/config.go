@@ -8,9 +8,9 @@ import (
 
 // Config represents the application configuration
 type Config struct {
-	Server   ServerConfig    `json:"server"`
-	Auth     AuthConfig      `json:"auth"`
-	Provider ProviderConfig  `json:"provider"`
+	Server   ServerConfig   `json:"server"`
+	Auth     AuthConfig     `json:"auth"`
+	Provider ProviderConfig `json:"provider"`
 }
 
 // ServerConfig holds HTTP server settings
@@ -30,18 +30,30 @@ type AuthConfig struct {
 // ProviderConfig holds provider-specific settings
 type ProviderConfig struct {
 	DeepSeek DeepSeekConfig `json:"deepseek"`
+	Qwen     QwenConfig     `json:"qwen"`
 }
 
 // DeepSeekConfig holds DeepSeek provider settings
 // Timeout and TokenRefreshInterval are integers (seconds) in config.json per AGENTS.md
 type DeepSeekConfig struct {
-	Enabled              bool `json:"enabled"`
+	Enabled              bool   `json:"enabled"`
 	Email                string `json:"email"`
 	Password             string `json:"password,omitempty"`
 	BaseURL              string `json:"base_url"`
 	LoginURL             string `json:"login_url"`
 	CreateSessionURL     string `json:"create_session_url"`
-	Timeout              int    `json:"timeout"`               // seconds
+	Timeout              int    `json:"timeout"`                // seconds
+	TokenRefreshInterval int    `json:"token_refresh_interval"` // seconds
+}
+
+// QwenConfig holds Qwen provider settings
+// Timeout and TokenRefreshInterval are integers (seconds) in config.json per AGENTS.md
+type QwenConfig struct {
+	Enabled              bool   `json:"enabled"`
+	Email                string `json:"email"`
+	Password             string `json:"password,omitempty"`
+	BaseURL              string `json:"base_url"`
+	Timeout              int    `json:"timeout"`                // seconds
 	TokenRefreshInterval int    `json:"token_refresh_interval"` // seconds
 }
 
@@ -51,8 +63,8 @@ func DefaultConfig() *Config {
 		Server: ServerConfig{
 			Host:         "0.0.0.0",
 			Port:         "5001",
-			ReadTimeout:  30,  // seconds per AGENTS.md
-			WriteTimeout: 60,  // seconds per AGENTS.md
+			ReadTimeout:  30, // seconds per AGENTS.md
+			WriteTimeout: 60, // seconds per AGENTS.md
 		},
 		Auth: AuthConfig{
 			APIKeys: []string{},
@@ -63,6 +75,12 @@ func DefaultConfig() *Config {
 				BaseURL:              "https://chat.deepseek.com",
 				LoginURL:             "/api/v0/users/login",
 				CreateSessionURL:     "/api/v0/chat/create_session",
+				Timeout:              120,  // seconds per AGENTS.md
+				TokenRefreshInterval: 1800, // 30 minutes in seconds
+			},
+			Qwen: QwenConfig{
+				Enabled:              false,
+				BaseURL:              "https://chat.qwen.ai",
 				Timeout:              120,  // seconds per AGENTS.md
 				TokenRefreshInterval: 1800, // 30 minutes in seconds
 			},
@@ -106,6 +124,15 @@ func (c *Config) Validate() error {
 		}
 		if c.Provider.DeepSeek.Password == "" {
 			return fmt.Errorf("deepseek password is required when deepseek is enabled")
+		}
+	}
+
+	if c.Provider.Qwen.Enabled {
+		if c.Provider.Qwen.Email == "" {
+			return fmt.Errorf("qwen email is required when qwen is enabled")
+		}
+		if c.Provider.Qwen.Password == "" {
+			return fmt.Errorf("qwen password is required when qwen is enabled")
 		}
 	}
 

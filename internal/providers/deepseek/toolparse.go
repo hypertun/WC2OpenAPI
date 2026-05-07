@@ -40,6 +40,8 @@ func parseToolCallsFromText(text string) ([]providers.ToolCall, error) {
 
 	var toolCalls []providers.ToolCall
 	for i, call := range parsedCalls {
+		slog.Debug("Parsed tool call", "name", call.Name, "args", call.Input)
+
 		// Convert input to JSON string for OpenAI format
 		argsJSON, err := json.Marshal(call.Input)
 		if err != nil {

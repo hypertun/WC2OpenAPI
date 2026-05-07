@@ -78,6 +78,53 @@ type ToolCallFunction struct {
 	Arguments string `json:"arguments"` // JSON string of arguments
 }
 
+
+// MarshalJSON implements json.Marshaler to ensure Arguments is always a JSON string
+func (t ToolCallFunction) MarshalJSON() ([]byte, error) {
+	// Use a temporary struct to ensure proper marshaling
+	type Alias ToolCallFunction
+	return json.Marshal(Alias(t))
+}
+
+// ToolCallArgs handles flexible unmarshaling of tool call arguments
+// It accepts both JSON objects and JSON strings for backwards compatibility
+type ToolCallArgs struct {
+	data map[string]interface{}
+}
+
+// UnmarshalJSON implements json.Unmarshaler to handle both string and object formats
+func (t *ToolCallArgs) UnmarshalJSON(data []byte) error {
+	// First try to unmarshal as a map (JSON object)
+	var objMap map[string]interface{}
+	if err := json.Unmarshal(data, &objMap); err == nil {
+		t.data = objMap
+		return nil
+	}
+	
+	// If that fails, try to unmarshal as a string and then parse it
+	var str string
+	if err := json.Unmarshal(data, &str); err == nil {
+		var parsedMap map[string]interface{}
+		if err := json.Unmarshal([]byte(str), &parsedMap); err == nil {
+			t.data = parsedMap
+			return nil
+		}
+	}
+	
+	// Return the original error
+	return fmt.Errorf("failed to unmarshal tool call arguments: %w", json.Unmarshal(data, &objMap))
+}
+
+// MarshalJSON implements json.Marshaler to serialize as JSON string
+func (t ToolCallArgs) MarshalJSON() ([]byte, error) {
+	return json.Marshal(t.data)
+}
+
+// ToMap returns the underlying map
+func (t ToolCallArgs) ToMap() map[string]interface{} {
+	return t.data
+}
+
 // ToolChoice can be "auto", "none", or {"type":"function","function":{"name":"..."}}
 type ToolChoice any
 
