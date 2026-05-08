@@ -8,150 +8,79 @@ WebChat to API - A lightweight Go middleware that converts AI webchat interfaces
 - 🌊 **Streaming support** - Server-Sent Events (SSE) for real-time responses
 - 🔐 **Automated login** - Automatically authenticates with provider webchat
 - 🔌 **Multi-provider support** - DeepSeek and Qwen providers included
-- 🔧 **Tool call error correction** - Automatic parameter validation and retry with feedback
-- 📊 **Structured logging** - Debug tool call validation, corrections, and retry metrics
+- 🔧 **Tool calling** - DSML and `##TOOL_CALL##` markup parsing for function calls
+- 📊 **Structured logging** - Debug tool call validation and retry metrics
 
 ## Quick Start
 
-### Prerequisites
-
-- Go 1.21+ (for building from source)
-- DeepSeek account credentials
-
-### Configuration
-
-Create a `config.json` file based on the example:
-
 ```bash
 cp configs/config.example.json config.json
-```
-
-Edit `config.json`:
-
-```json
-{
-  "server": {
-    "host": "0.0.0.0",
-    "port": "5001"
-  },
-  "auth": {
-    "api_keys": ["your-api-key-here"]
-  },
-  "provider": {
-    "deepseek": {
-      "enabled": true,
-      "email": "your-email@example.com",
-      "base_url": "https://chat.deepseek.com"
-    },
-    "qwen": {
-      "enabled": false,
-      "email": "your-email@example.com",
-      "base_url": "https://chat.qwen.ai"
-    }
-  }
-}
-```
-
-**Security Note**: Set passwords via environment variables instead of config file:
-
-```bash
+export DEEPSEEK_EMAIL="your-email@example.com"
 export DEEPSEEK_PASSWORD="your-password"
+export QWEN_EMAIL="your-email@example.com"
 export QWEN_PASSWORD="your-password"
-```
-
-### Building and Running Binary
-
-```bash
-# Install dependencies
 go mod tidy
-
-# Build binary
-go build -o wc2api ./cmd/wc2api
-
-# Run
-./wc2api -config config.json
-```
-
-### Running from Source
-
-```bash
-# Install dependencies
-go mod tidy
-
-# Run directly
 go run ./cmd/wc2api
 ```
 
+## Build & Run
+
+```bash
+go mod tidy
+go run ./cmd/wc2api                        # dev
+go build -o wc2api ./cmd/wc2api            # build binary
+./wc2api -config config.json               # run binary with config
+```
+
+## Configuration
+
+- Copy `configs/config.example.json` to `config.json` and edit.
+- **DeepSeek Credentials**: Use env vars `DEEPSEEK_EMAIL` + `DEEPSEEK_PASSWORD` (not config file).
+- **Qwen Credentials**: Use env vars `QWEN_EMAIL` + `QWEN_PASSWORD` (not config file).
+- **Timeouts**: All values in `config.json` are **integers (seconds)**, not Go duration strings.
+- **API keys**: Set `auth.api_keys` in config. If empty, auth middleware is bypassed (dev mode).
+- `.gitignore` includes `config.json` and `.env`.
+
 ## API Endpoints
 
-### Health Check
-```
-GET /healthz
-```
-
-### List Models
-```
-GET /v1/models
-Authorization: Bearer your-api-key
-```
-
-### Chat Completions
-```
-POST /v1/chat/completions
-Authorization: Bearer your-api-key
-Content-Type: application/json
-
-{
-  "model": "deepseek-chat",
-  "messages": [
-    {"role": "user", "content": "Hello!"}
-  ],
-  "stream": false
-}
-```
-
-#### Streaming Request
-```
-POST /v1/chat/completions
-Authorization: Bearer your-api-key
-Content-Type: application/json
-
-{
-  "model": "deepseek-chat",
-  "messages": [
-    {"role": "user", "content": "Tell me a story"}
-  ],
-  "stream": true
-}
-```
+- `GET /healthz` — Health check (no auth)
+- `GET /v1/models` — List models (auth required if API keys configured)
+- `POST /v1/chat/completions` — Chat completion (streaming supported)
 
 ## Supported Models
 
 ### DeepSeek
-- `deepseek-v4-flash` - Fast general chat model (model_type: default)
-- `deepseek-v4-pro` - Expert model with enhanced capabilities (model_type: expert)
-- `deepseek-v4-flash-nothinking` / `deepseek-v4-pro-nothinking` - Disable thinking/reasoning
+- `deepseek-v4-flash` — Fast general chat model (model_type: default)
+- `deepseek-v4-pro` — Expert model with enhanced capabilities (model_type: expert)
+- `deepseek-v4-flash-nothinking` / `deepseek-v4-pro-nothinking` — Disable thinking/reasoning (suffix stripped before sending)
 
 ### Qwen
-- `qwen3.5-flash` - Fast general chat model (model_type: default)
-- `qwen3.6-plus` - Enhanced model with more capabilities (model_type: expert)
-- `qwen3.5-flash-nothinking` / `qwen3.6-plus-nothinking` - Disable thinking/reasoning
+- `qwen3.5-flash` — Fast general chat model (model_type: default)
+- `qwen3.6-plus` — Enhanced model with more capabilities (model_type: expert)
+- `qwen3.5-flash-nothinking` / `qwen3.6-plus-nothinking` — Disable thinking/reasoning (suffix stripped before sending)
 
-## Configuration Options
+## Provider Support
 
-### Environment Variables
+Both DeepSeek and Qwen providers can be enabled:
+- **Model routing**: Requests route based on model name prefix (`deepseek-*` → DeepSeek, `qwen-*` → Qwen)
+- **Fallback**: Unrecognized model names use the first available provider
 
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `DEEPSEEK_EMAIL` | DeepSeek account email | Yes |
-| `DEEPSEEK_PASSWORD` | DeepSeek account password | Yes |
-| `WC2API_PORT` | Server port (default: 5001) | No |
-| `WC2API_HOST` | Server host (default: 0.0.0.0) | No |
-| `WC2API_API_KEYS` | Comma-separated API keys for client auth | No |
+## Tool Calling
 
-### Config File Options
+Implemented via tool schema injection in system prompt + parsing of response text:
 
-See `configs/config.example.json` for all available options.
+**DeepSeek:**
+- DSML markup (`` / `<invoke>`) parsing
+- Tool schemas injected into system message as DSML instructions
+
+**Qwen:**
+- `##TOOL_CALL##` / `##END_CALL##` marker parsing
+- Native function calling disabled (`function_calling: false, enable_tools: false`) to prevent upstream interception
+- Supports `phase` field in streaming: "answer" (text), "think" (reasoning), "tool_call" (structured calls)
+
+## Streaming Quirk
+
+Both providers buffer ALL chunks before sending any to the client. Tool calls can only be detected after the full response text is available (appear as markup). Only after detecting no tool calls does it replay content chunks one-by-one.
 
 ## Architecture
 
@@ -162,7 +91,6 @@ wc2api
     ├─ HTTP Server (chi router)
     ├─ Auth Middleware
     ├─ OpenAI API Handlers
-    ├─ Tool Call Error Correction (Phases 1-7)
     └─ Provider Interface
          ↓
     DeepSeek Provider / Qwen Provider
@@ -170,40 +98,38 @@ wc2api
     chat.deepseek.com / chat.qwen.ai
 ```
 
-## Documentation
-
-- [Tool Calls Documentation](docs/tool-calls.md) - How tool calling works, validation, and retry logic
-- [Error Correction Examples](docs/error-correction-examples.md) - Real-world examples of automatic parameter fixes
-- [API Documentation](docs/api.md) - Complete API reference with retry behavior
-- [Troubleshooting Guide](docs/troubleshooting.md) - Common issues and solutions
-- [Migration Guide](docs/migration-guide.md) - Upgrading to the latest version
-
-## Development
-
-### Project Structure
+## Project Structure
 
 ```
-wc2api/
-├── cmd/wc2api/          # Entry point
-├── internal/
-│   ├── server/          # HTTP server & middleware
-│   ├── handlers/        # API handlers
-│   ├── providers/       # Provider interface & implementations
-│   │   └── deepseek/    # DeepSeek provider
-│   └── config/          # Configuration
-└── configs/             # Configuration examples
+cmd/wc2api/                # Entry point (flag parsing, signal handling)
+internal/
+  server/                  # chi v5 router, middleware (auth, CORS, logging)
+    middleware/
+  handlers/                # OpenAI-compatible HTTP handlers (health, models, chat)
+  providers/               # Provider interface + shared types
+    deepseek/              # DeepSeek webchat implementation (DS2API-style)
+    qwen/                  # Qwen webchat implementation (API-based auth)
+  config/                  # JSON + env config loader
+  toolcall/                # DSML/##TOOL_CALL## tool call parsing + prompt injection
+configs/                   # Config templates (example only)
 ```
 
-### Adding a New Provider
+## Key Dependencies
 
-1. Implement the `Provider` interface in `internal/providers/yourprovider/`
-2. Add provider configuration to `config.Config`
-3. Initialize provider in `server.New()`
-4. Register models in the provider
+- **chi v5** router
+- **go-chi/cors** for CORS  
+- **refraction-networking/utls** for TLS fingerprint spoofing (DeepSeek, Safari-like, HTTP/1.1-only to bypass WAF)
+
+## Constraints
+
+- No test suite or CI configuration present
+- No linting or formatting tools configured  
+- Auth token auto-refreshes every 30 minutes (configurable via `token_refresh_interval` in config)
+- No Docker support
 
 ## License
 
-MIT License - See LICENSE file
+MIT License
 
 ## Disclaimer
 
