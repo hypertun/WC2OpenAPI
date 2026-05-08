@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	providers "github.com/user/wc2api/internal/providers"
 )
 
 func TestParseSchema(t *testing.T) {
@@ -75,10 +77,10 @@ func TestValidateToolCall_RequiredFields(t *testing.T) {
 	if len(result.Errors) == 0 {
 		t.Error("Expected at least one error")
 	} else {
-			msg := result.Errors[0].Message
-			if !strings.Contains(msg, "required") && !strings.Contains(msg, "file_path") {
-				t.Errorf("Error message should mention required field, got: %s", msg)
-			}
+		msg := result.Errors[0].Message
+		if !strings.Contains(msg, "required") && !strings.Contains(msg, "file_path") {
+			t.Errorf("Error message should mention required field, got: %s", msg)
+		}
 	}
 }
 
@@ -562,5 +564,118 @@ func TestValidateToolCall_NestedObjectRequired(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("Expected error about missing 'id', got: %v", result.Errors)
+	}
+}
+
+// Helper to create a tool for testing
+func makeTestTool(name, schemaStr string) providers.Tool {
+	var params map[string]interface{}
+	json.Unmarshal([]byte(schemaStr), &params)
+	return providers.Tool{
+		Type: "function",
+		Function: providers.ToolFunction{
+			Name:        name,
+			Description: "Test tool: " + name,
+			Parameters:  params,
+		},
+	}
+}
+
+func TestValidateToolCallsWithErrors_NoErrors(t *testing.T) {
+	tools := []providers.Tool{
+		makeTestTool("Bash", `{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}`),
+	}
+	toolCalls := []providers.ToolCall{
+		{ID: "1", Type: "function", Function: providers.ToolCallFunction{Name: "Bash", Arguments: `{"command": "ls -la"}`}},
+	}
+
+	errs := ValidateToolCallsWithErrors(toolCalls, tools)
+	if len(errs) != 0 {
+		t.Errorf("expected no errors, got %d: %v", len(errs), errs)
+	}
+}
+
+func TestValidateToolCallsWithErrors_MultipleTools(t *testing.T) {
+	tools := []providers.Tool{
+		makeTestTool("Bash", `{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}`),
+		makeTestTool("Read", `{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}`),
+	}
+	toolCalls := []providers.ToolCall{
+		{ID: "1", Type: "function", Function: providers.ToolCallFunction{Name: "Bash", Arguments: `{"command": "ls"}`}},
+		{ID: "2", Type: "function", Function: providers.ToolCallFunction{Name: "Read", Arguments: `{}`}}, // missing file_path
+	}
+
+	errs := ValidateToolCallsWithErrors(toolCalls, tools)
+	if len(errs) == 0 {
+		t.Fatal("expected errors for missing required param")
+	}
+	found := false
+	for _, e := range errs {
+		if e.ToolName == "Read" && strings.Contains(e.Parameter, "file_path") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected error for Read missing file_path, got: %v", errs)
+	}
+}
+
+func TestValidateToolCallsWithErrors_NilTools(t *testing.T) {
+	toolCalls := []providers.ToolCall{
+		{ID: "1", Type: "function", Function: providers.ToolCallFunction{Name: "UnknownTool", Arguments: `{"param": "value"}`}},
+	}
+
+	errs := ValidateToolCallsWithErrors(toolCalls, nil)
+	if len(errs) == 0 {
+		t.Error("expected warning for nil tools with unknown tool")
+	}
+}
+
+func TestFormatValidationErrors_Empty(t *testing.T) {
+	msg := FormatValidationErrors([]*ValidationError{})
+	if msg != "" {
+		t.Errorf("expected empty string, got %q", msg)
+	}
+}
+
+func TestFormatValidationErrors_Single(t *testing.T) {
+	errs := []*ValidationError{
+		{ToolName: "Bash", Parameter: "command", Message: "required", Severity: "error"},
+	}
+	msg := FormatValidationErrors(errs)
+	if !strings.Contains(msg, "Bash") {
+		t.Errorf("expected Bash in formatted errors, got: %q", msg)
+	}
+}
+
+func TestFormatValidationErrors_Multiple(t *testing.T) {
+	errs := []*ValidationError{
+		{ToolName: "Bash", Parameter: "command", Message: "required", Severity: "error"},
+		{ToolName: "Read", Parameter: "file_path", Message: "required", Severity: "error"},
+	}
+	msg := FormatValidationErrors(errs)
+	if !strings.Contains(msg, "Bash") || !strings.Contains(msg, "Read") {
+		t.Errorf("expected both tool names in formatted errors, got: %q", msg)
+	}
+}
+
+func TestValidationResult_HasErrors_True(t *testing.T) {
+	r := &ValidationResult{
+		IsValid: false,
+		Errors:  []*ValidationError{{Message: "test"}},
+	}
+	if !r.HasErrors() {
+		t.Error("expected HasErrors() to return true")
+	}
+}
+
+func TestValidationResult_HasWarnings_True(t *testing.T) {
+	r := &ValidationResult{
+		IsValid:  true,
+		Warnings: []*ValidationError{{Message: "test", Severity: "warning"}},
+	}
+	if !r.HasWarnings() {
+		t.Error("expected HasWarnings() to return true")
 	}
 }

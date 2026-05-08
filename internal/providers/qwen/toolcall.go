@@ -2,7 +2,6 @@ package qwen
 
 import (
 	"fmt"
-	"strings"
 
 	providers "github.com/user/wc2api/internal/providers"
 	"github.com/user/wc2api/internal/toolcall"
@@ -15,25 +14,18 @@ func injectToolPrompt(messages []providers.Message, tools []providers.Tool, tool
 		return messages
 	}
 
-	// Extract and obfuscate tool names for the prompt
-	var toolNames []string
-	for _, tool := range tools {
-		toolNames = append(toolNames, toQwenName(tool.Function.Name))
-	}
-
-	// Build tool schemas section (names obfuscated)
-	var toolSchemas []string
-	for _, tool := range tools {
-		schema := tool.Function
-		qwenName := toQwenName(schema.Name)
-		toolSchemas = append(toolSchemas, fmt.Sprintf("- %s: %s", qwenName, schema.Description))
+	// Create obfuscated copy of tools with Qwen-safe names
+	obfuscatedTools := make([]providers.Tool, len(tools))
+	for i, tool := range tools {
+		obfuscatedTools[i] = tool
+		obfuscatedTools[i].Function.Name = toQwenName(tool.Function.Name)
 	}
 
 	// Build Qwen tool call instructions using the shared package (names already obfuscated)
-	toolInstruction := toolcall.BuildQwenToolCallInstructions(toolNames)
+	toolInstruction := toolcall.BuildQwenToolCallInstructions(obfuscatedTools)
 
 	// Build the full tool prompt
-	toolPrompt := fmt.Sprintf("You have access to the following tools:\n\n%s\n\n%s", strings.Join(toolSchemas, "\n"), toolInstruction)
+	toolPrompt := fmt.Sprintf("You have access to the following actions:\n\n%s", toolInstruction)
 
 	// Obfuscate bare tool name mentions in the instruction text itself
 	toolPrompt = obfuscateBareNames(toolPrompt)

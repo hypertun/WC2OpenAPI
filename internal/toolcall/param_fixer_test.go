@@ -249,7 +249,7 @@ func TestFixParameters(t *testing.T) {
 		"path":  "/tmp",
 		"level": "3",
 	}
-	got := FixParameters("Bash", input, "")
+	got, summary := FixParameters("Bash", input, "")
 	if got == nil {
 		t.Fatal("expected non-nil result")
 	}
@@ -268,10 +268,72 @@ func TestFixParameters(t *testing.T) {
 	if got["level"].(float64) != 3 {
 		t.Errorf("expected level=3, got %v", got["level"])
 	}
+	if summary.Total() == 0 {
+		t.Error("expected corrections to be detected")
+	}
 }
 
 func TestFixParameters_Nil(t *testing.T) {
-	if got := FixParameters("Bash", nil, ""); got != nil {
+	got, summary := FixParameters("Bash", nil, "")
+	if got != nil {
 		t.Errorf("expected nil, got %v", got)
+	}
+	if summary.Total() != 0 {
+		t.Errorf("expected 0 corrections, got %d", summary.Total())
+	}
+}
+
+func TestFixParameters_FixSummary_TypeCoercions(t *testing.T) {
+	input := map[string]interface{}{
+		"command": "ls",
+		"timeout": "30", // string that should be number
+	}
+	_, summary := FixParameters("Bash", input, "")
+	if summary.TypeCoercions == 0 {
+		t.Error("expected type_coercions to be > 0")
+	}
+}
+
+func TestFixParameters_FixSummary_NameMappings(t *testing.T) {
+	input := map[string]interface{}{
+		"cmd":   "ls -la",
+		"path":  "/tmp",
+	}
+	_, summary := FixParameters("Bash", input, "")
+	if summary.NameMappings == 0 {
+		t.Error("expected name_mappings to be > 0")
+	}
+}
+
+func TestFixParameters_FixSummary_Defaults(t *testing.T) {
+	input := map[string]interface{}{
+		"command": "ls",
+		// timeout is missing, should get default
+	}
+	_, summary := FixParameters("Bash", input, "")
+	if summary.Defaults == 0 {
+		t.Error("expected defaults to be > 0")
+	}
+}
+
+func TestFixParameters_FixSummary_StructureFixes(t *testing.T) {
+	input := map[string]interface{}{
+		"command": "ls",
+		"questions": "single question", // should be wrapped in array
+	}
+	_, summary := FixParameters("Bash", input, "")
+	if summary.StructureFixes == 0 {
+		t.Error("expected structure_fixes to be > 0")
+	}
+}
+
+func TestFixParameters_FixSummary_NoCorrections(t *testing.T) {
+	input := map[string]interface{}{
+		"command": "ls",
+		"timeout": float64(30000),
+	}
+	_, summary := FixParameters("Bash", input, "")
+	if summary.Total() != 0 {
+		t.Errorf("expected 0 corrections, got %d", summary.Total())
 	}
 }

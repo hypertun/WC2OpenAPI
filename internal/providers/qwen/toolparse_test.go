@@ -1,7 +1,12 @@
 package qwen
 
 import (
+	"log/slog"
+	"strings"
 	"testing"
+
+	"github.com/user/wc2api/internal/providers"
+	testutil "github.com/user/wc2api/internal/testutil"
 )
 
 func TestParseToolCallsMultiple(t *testing.T) {
@@ -106,5 +111,44 @@ func TestParseToolCallsEmpty(t *testing.T) {
 	}
 	if calls != nil {
 		t.Errorf("expected nil calls for empty input, got %v", calls)
+	}
+}
+
+func TestValidateSingleToolCall_LogsResults(t *testing.T) {
+	captor := &testutil.LogCaptor{}
+	logger := slog.New(captor)
+
+	tools := []providers.Tool{
+		{Type: "function", Function: providers.ToolFunction{
+			Name: "calculator",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"expr": map[string]interface{}{"type": "string"},
+				},
+			},
+		}},
+	}
+
+	// Temporarily set the default logger to capture logs
+	oldLogger := slog.Default()
+	slog.SetDefault(logger)
+	// validateSingleToolCall is not exported, so we test via parseToolCallsFromText
+	// which calls validation internally
+	text := `##TOOL_CALL##{"name":"calculator","input":{"expr":123}}##END_CALL##`
+	parseToolCallsFromText(text, tools)
+	slog.SetDefault(oldLogger)
+
+	// Should log validation result
+	records := captor.Records()
+	found := false
+	for _, r := range records {
+		if strings.Contains(r.Message, "Validation result") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected 'Validation result' log message")
 	}
 }

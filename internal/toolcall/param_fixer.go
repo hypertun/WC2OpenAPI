@@ -140,19 +140,127 @@ func ApplyDefaults(toolName string, input map[string]interface{}) map[string]int
 	return input
 }
 
-func FixParameters(toolName string, input map[string]interface{}, schemaJSON string) map[string]interface{} {
+type FixSummary struct {
+	TypeCoercions int
+	NameMappings  int
+	Defaults      int
+	StructureFixes int
+}
+
+func (s *FixSummary) Total() int {
+	return s.TypeCoercions + s.NameMappings + s.Defaults + s.StructureFixes
+}
+
+func FixParameters(toolName string, input map[string]interface{}, schemaJSON string) (map[string]interface{}, *FixSummary) {
 	if input == nil {
-		return nil
+		return nil, &FixSummary{}
 	}
 	result := make(map[string]interface{})
 	for k, v := range input {
 		result[k] = v
 	}
+
+	summary := &FixSummary{}
+
+	// Track type coercions
 	for k, v := range result {
+		originalType := ""
+		switch v.(type) {
+		case string:
+			originalType = "string"
+		case bool:
+			originalType = "bool"
+		case float64:
+			originalType = "number"
+		case int:
+			originalType = "int"
+		case []interface{}:
+			originalType = "array"
+		case map[string]interface{}:
+			originalType = "object"
+		}
 		result[k] = CoerceValue(v)
+		newVal := result[k]
+		if originalType != "" {
+			newType := ""
+			switch newVal.(type) {
+			case string:
+				newType = "string"
+			case bool:
+				newType = "bool"
+			case float64:
+				newType = "number"
+			case []interface{}:
+				newType = "array"
+			case map[string]interface{}:
+				newType = "object"
+			}
+			if newType != originalType {
+				summary.TypeCoercions++
+			}
+		}
 	}
 	result = ApplyNameMappings(result)
+	summary.NameMappings = countNameMappingsApplied(result, input)
 	result = ApplyDefaults(toolName, result)
+	summary.Defaults = countDefaultsApplied(toolName, result, input)
 	result = FixStructure(result)
-	return result
+	summary.StructureFixes = countStructureFixes(result, input)
+
+	if summary.Total() > 0 {
+		slog.Info("Tool call corrections applied",
+			"tool", toolName,
+			"type_coercions", summary.TypeCoercions,
+			"name_mappings", summary.NameMappings,
+			"defaults", summary.Defaults,
+			"structure_fixes", summary.StructureFixes,
+		)
+	}
+	return result, summary
+}
+
+func countNameMappingsApplied(result, original map[string]interface{}) int {
+	count := 0
+	for alias, canonical := range paramNameAliases {
+		if _, hasAlias := original[alias]; hasAlias {
+			if _, hasResult := result[canonical]; hasResult {
+				if _, origHasCanonical := original[canonical]; !origHasCanonical {
+					count++
+				}
+			}
+		}
+	}
+	return count
+}
+
+func countDefaultsApplied(toolName string, result, original map[string]interface{}) int {
+	count := 0
+	if defaults, ok := toolParamDefaults[toolName]; ok {
+		for param := range defaults {
+			if _, exists := original[param]; !exists {
+				if _, exists := result[param]; exists {
+					count++
+				}
+			}
+		}
+	}
+	return count
+}
+
+func countStructureFixes(result, original map[string]interface{}) int {
+	count := 0
+	for k, origV := range original {
+		_, isOrigArray := origV.([]interface{})
+		if !isOrigArray && arrayParams[k] {
+			count++
+		}
+		if strVal, ok := origV.(string); ok {
+			if strings.HasPrefix(strVal, "{") {
+				count++
+			} else if strings.HasPrefix(strVal, "[") {
+				count++
+			}
+		}
+	}
+	return count
 }

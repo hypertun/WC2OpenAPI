@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	providers "github.com/user/wc2api/internal/providers"
 	"reflect"
 	"regexp"
 	"strings"
@@ -559,4 +560,122 @@ func validateBasicStructure(input map[string]any) *ValidationResult {
 	}
 
 	return result
+}
+
+// ValidateToolCallsWithErrors validates a list of tool calls against their tool definitions.
+// Returns a combined list of validation errors.
+func ValidateToolCallsWithErrors(toolCalls []providers.ToolCall, tools []providers.Tool) []*ValidationError {
+	var allErrors []*ValidationError
+
+	if len(toolCalls) == 0 {
+		return allErrors
+	}
+
+	// Build a map of tool name -> schema for quick lookup
+	toolSchemas := make(map[string]string)
+	if len(tools) > 0 {
+		for _, tool := range tools {
+			if tool.Function.Parameters != nil {
+				// Parameters is map[string]interface{}, convert to JSON string
+				jsonBytes, err := json.Marshal(tool.Function.Parameters)
+				if err == nil {
+					toolSchemas[tool.Function.Name] = string(jsonBytes)
+				}
+			}
+		}
+	}
+
+	for _, tc := range toolCalls {
+		toolName := tc.Function.Name
+		argsJSON := tc.Function.Arguments
+
+		// Parse the arguments JSON
+		var args map[string]interface{}
+		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+			allErrors = append(allErrors, &ValidationError{
+				ToolName:  toolName,
+				Parameter: "",
+				Expected:  "valid JSON object",
+				Actual:    argsJSON,
+				Message:   "Invalid JSON arguments: " + err.Error(),
+				Severity:  "error",
+			})
+			continue
+		}
+
+		// Find the tool schema
+		schema, ok := toolSchemas[toolName]
+		if !ok {
+			// Try fallback schema
+			schema = GetBuiltInSchema(toolName)
+			if schema == "" {
+				// No schema available, do basic validation and add warning
+				result := validateBasicStructure(args)
+				// Add a warning that no tool definition was found
+				allErrors = append(allErrors, &ValidationError{
+					ToolName:  toolName,
+					Parameter: "",
+					Expected:  "tool definition",
+					Actual:    "nil",
+					Message:   "No tool definition found, using basic validation only",
+					Severity:  "warning",
+				})
+				for _, e := range result.Errors {
+					e.ToolName = toolName
+					allErrors = append(allErrors, e)
+				}
+				for _, w := range result.Warnings {
+					w.ToolName = toolName
+					allErrors = append(allErrors, w)
+				}
+				continue
+			}
+		}
+
+		// Validate against schema
+		result := ValidateToolCall(toolName, args, schema)
+		for _, e := range result.Errors {
+			allErrors = append(allErrors, e)
+		}
+		for _, w := range result.Warnings {
+			allErrors = append(allErrors, w)
+		}
+	}
+
+	return allErrors
+}
+
+// FormatValidationErrors formats a list of validation errors into a human-readable string.
+func FormatValidationErrors(errors []*ValidationError) string {
+	if len(errors) == 0 {
+		return ""
+	}
+
+	toolErrors := make(map[string][]string)
+	for _, err := range errors {
+		if err == nil {
+			continue
+		}
+		key := err.ToolName
+		if key == "" {
+			key = "unknown"
+		}
+		msg := fmt.Sprintf("  - `%s`: %s (expected: %s, got: %v)",
+			err.Parameter, err.Message, err.Expected, err.Actual)
+		toolErrors[key] = append(toolErrors[key], msg)
+	}
+
+	msg := "Tool call error correction required. " +
+		"The following tool calls had parameter errors and were NOT executed:\n\n"
+	for tool, errs := range toolErrors {
+		msg += tool + ":\n"
+		for _, e := range errs {
+			msg += e + "\n"
+		}
+		msg += "\n"
+	}
+	msg += "Please retry with corrected parameters. " +
+		"Ensure all required fields are provided with correct types."
+
+	return msg
 }

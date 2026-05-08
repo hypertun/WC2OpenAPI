@@ -2,7 +2,12 @@ package deepseek
 
 import (
 	"encoding/json"
+	"log/slog"
+	"strings"
 	"testing"
+
+	providers "github.com/user/wc2api/internal/providers"
+	testutil "github.com/user/wc2api/internal/testutil"
 )
 
 func TestParseToolCallsFromText(t *testing.T) {
@@ -107,6 +112,62 @@ func TestParseToolCallsFromText_UserExample(t *testing.T) {
 		}
 		if cmd, ok := args["command"].(string); !ok || cmd != expectedCommands[i] {
 			t.Errorf("tool call %d: expected command '%s', got '%v'", i, expectedCommands[i], args["command"])
+		}
+	}
+}
+
+func TestValidateToolCall_LogsValidationResults(t *testing.T) {
+	captor := &testutil.LogCaptor{}
+	logger := slog.New(captor)
+
+	tools := []providers.Tool{
+		{Type: "function", Function: providers.ToolFunction{
+			Name: "Bash",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"command": map[string]interface{}{"type": "string"},
+				},
+			},
+		}},
+	}
+
+	// Call validateToolCall with correct signature
+	// Temporarily set the default logger to capture logs
+	oldLogger := slog.Default()
+	slog.SetDefault(logger)
+	validateToolCall("Bash", map[string]any{"command": 123}, tools)
+	slog.SetDefault(oldLogger)
+
+	// Should log validation failure
+	records := captor.Records()
+	found := false
+	for _, r := range records {
+		if strings.Contains(r.Message, "Validation result") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected 'Validation result' log message")
+	}
+}
+
+func TestValidateToolCall_NoTools_NoLog(t *testing.T) {
+	captor := &testutil.LogCaptor{}
+	logger := slog.New(captor)
+
+	// No tools provided
+	oldLogger := slog.Default()
+	slog.SetDefault(logger)
+	validateToolCall("Bash", map[string]any{"command": "ls"}, nil)
+	slog.SetDefault(oldLogger)
+
+	// Should NOT log validation result (no tools to validate against)
+	records := captor.Records()
+	for _, r := range records {
+		if strings.Contains(r.Message, "Validation result") {
+			t.Error("should not log 'Validation result' when no tools provided")
 		}
 	}
 }

@@ -1,10 +1,7 @@
 package deepseek
 
 import (
-	"fmt"
-	"strings"
-
-	"github.com/user/wc2api/internal/providers"
+	providers "github.com/user/wc2api/internal/providers"
 	"github.com/user/wc2api/internal/toolcall"
 )
 
@@ -15,24 +12,8 @@ func injectToolPrompt(messages []providers.Message, tools []providers.Tool, tool
 		return messages
 	}
 
-	// Extract tool names for the prompt
-	var toolNames []string
-	for _, tool := range tools {
-		toolNames = append(toolNames, tool.Function.Name)
-	}
-
-	// Build tool schemas section
-	var toolSchemas []string
-	for _, tool := range tools {
-		schema := tool.Function
-		toolSchemas = append(toolSchemas, fmt.Sprintf("- %s: %s", schema.Name, schema.Description))
-	}
-
 	// Build DSML tool call instructions using the shared package
-	toolInstruction := toolcall.BuildToolCallInstructions(toolNames)
-
-	// Build the full tool prompt
-	toolPrompt := fmt.Sprintf("You have access to the following tools:\n\n%s\n\n%s", strings.Join(toolSchemas, "\n"), toolInstruction)
+	toolPrompt := toolcall.BuildToolCallInstructions(tools)
 
 	// Handle tool_choice policy
 	switch tc := toolChoice.(type) {
@@ -72,6 +53,6 @@ func injectToolPrompt(messages []providers.Message, tools []providers.Tool, tool
 }
 
 // buildToolCallInstructions creates the DSML tool call format instructions
-func buildToolCallInstructions(toolNames []string) string {
-	return toolcall.BuildToolCallInstructions(toolNames)
+func buildToolCallInstructions(tools []providers.Tool) string {
+	return toolcall.BuildToolCallInstructions(tools)
 }

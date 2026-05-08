@@ -2,11 +2,76 @@ package toolcall
 
 import (
 	"fmt"
+	"sort"
 	"strings"
+
+	"github.com/user/wc2api/internal/providers"
 )
 
+func buildParameterHints(schema map[string]interface{}) string {
+	if schema == nil {
+		return ""
+	}
+	propsRaw, ok := schema["properties"]
+	if !ok {
+		return ""
+	}
+	props, ok := propsRaw.(map[string]interface{})
+	if !ok || len(props) == 0 {
+		return ""
+	}
+
+	required := map[string]bool{}
+	if reqRaw, ok := schema["required"]; ok {
+		if reqList, ok := reqRaw.([]interface{}); ok {
+			for _, r := range reqList {
+				if s, ok := r.(string); ok {
+					required[s] = true
+				}
+			}
+		}
+	}
+
+	var paramStrs []string
+	for name, propRaw := range props {
+		prop, ok := propRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		paramType := "any"
+		if t, ok := prop["type"]; ok {
+			if ts, ok := t.(string); ok {
+				paramType = ts
+			}
+		}
+		if required[name] {
+			paramStrs = append(paramStrs, fmt.Sprintf("%s: %s (required)", name, paramType))
+		} else {
+			paramStrs = append(paramStrs, fmt.Sprintf("%s: %s (optional)", name, paramType))
+		}
+	}
+	sort.Strings(paramStrs)
+	return strings.Join(paramStrs, ", ")
+}
+
+func toolDescriptionWithHints(tool providers.Tool) string {
+	name := tool.Function.Name
+	desc := tool.Function.Description
+	hints := buildParameterHints(tool.Function.Parameters)
+
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("  - %s", name))
+	if hints != "" {
+		b.WriteString(fmt.Sprintf("(%s)", hints))
+	}
+	if desc != "" {
+		b.WriteString(fmt.Sprintf(" — %s", desc))
+	}
+	return b.String()
+}
+
 // BuildToolCallInstructions generates DSML tool calling instructions
-func BuildToolCallInstructions(toolNames []string) string {
+func BuildToolCallInstructions(tools []providers.Tool) string {
 	var b strings.Builder
 
 	b.WriteString("TOOL CALL FORMAT — FOLLOW EXACTLY:\n\n")
@@ -16,30 +81,43 @@ func BuildToolCallInstructions(toolNames []string) string {
 	b.WriteString("  </|DSML|invoke>\n")
 	b.WriteString("</|DSML|tool_calls>\n\n")
 
+	if len(tools) > 0 {
+		b.WriteString("AVAILABLE TOOLS:\n")
+		for _, tool := range tools {
+			b.WriteString(toolDescriptionWithHints(tool))
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString("CORRECT EXAMPLE:\n")
+	b.WriteString("<|DSML|tool_calls>\n")
+	b.WriteString("  <|DSML|invoke name=\"Read\">\n")
+	b.WriteString("    <|DSML|parameter name=\"file_path\"><![CDATA[/path/to/file]]></|DSML|parameter>\n")
+	b.WriteString("  </|DSML|invoke>\n")
+	b.WriteString("</|DSML|tool_calls>\n\n")
+
 	b.WriteString("RULES:\n")
 	b.WriteString("1) Use the <|DSML|tool_calls> wrapper format.\n")
 	b.WriteString("2) Put tool name in name attribute.\n")
 	b.WriteString("3) All string values must use <![CDATA[...]]>.\n")
 	b.WriteString("4) Do NOT wrap XML in markdown fences.\n")
-	b.WriteString("5) First non-whitespace must be <|DSML|tool_calls|>.\n\n")
+	b.WriteString("5) First non-whitespace must be <|DSML|tool_calls|>.\n")
+	b.WriteString("6) Use EXACT parameter names as listed in AVAILABLE TOOLS.\n")
+	b.WriteString("7) Each parameter must match its expected type (strings in CDATA, numbers without quotes).\n\n")
 
-	if len(toolNames) > 0 {
-		b.WriteString("Available tools: ")
-		for i, name := range toolNames {
-			if i > 0 {
-				b.WriteString(", ")
-			}
-			b.WriteString(name)
-		}
-		b.WriteString("\n")
-	}
+	b.WriteString("COMMON MISTAKES:\n")
+	b.WriteString("- Wrong parameter name: \"path\" instead of \"file_path\"\n")
+	b.WriteString("- Missing required parameters\n")
+	b.WriteString("- Wrong type: \"command\": 123 instead of \"command\": \"ls -la\"\n")
+	b.WriteString("- Extra unknown parameters not listed in AVAILABLE TOOLS\n\n")
 
 	return b.String()
 }
 
 // BuildQwenToolCallInstructions generates Qwen-style tool calling instructions
 // using ##TOOL_CALL## text markers instead of DSML XML format
-func BuildQwenToolCallInstructions(toolNames []string) string {
+func BuildQwenToolCallInstructions(tools []providers.Tool) string {
 	var b strings.Builder
 
 	b.WriteString("=== ACTION MARKER PROTOCOL (client-parsed text patterns) ===\n")
@@ -47,13 +125,21 @@ func BuildQwenToolCallInstructions(toolNames []string) string {
 	b.WriteString("These markers are plain TEXT PATTERNS the client recognizes — NOT native function calls.\n")
 	b.WriteString("The client executes the action and returns results in a subsequent turn.\n\n")
 
-	if len(toolNames) > 0 {
-		b.WriteString(fmt.Sprintf("Available action names: %s\n\n", strings.Join(toolNames, ", ")))
+	b.WriteString("AVAILABLE ACTIONS:\n")
+	for _, tool := range tools {
+		b.WriteString(toolDescriptionWithHints(tool))
+		b.WriteString("\n")
 	}
+	b.WriteString("\n")
 
 	b.WriteString("WHEN YOU NEED TO TRIGGER AN ACTION — emit this exact text pattern (nothing else):\n")
 	b.WriteString("##TOOL_CALL##\n")
 	b.WriteString(`{"name": "ACTION_NAME", "input": {"param1": "value1"}}` + "\n")
+	b.WriteString("##END_CALL##\n\n")
+
+	b.WriteString("CORRECT EXAMPLE:\n")
+	b.WriteString("##TOOL_CALL##\n")
+	b.WriteString(`{"name": "Read", "input": {"file_path": "/path/to/file"}}` + "\n")
 	b.WriteString("##END_CALL##\n\n")
 
 	b.WriteString("MULTI-TURN RULES:\n")
@@ -65,9 +151,23 @@ func BuildQwenToolCallInstructions(toolNames []string) string {
 	b.WriteString("STRICT RULES:\n")
 	b.WriteString("- No preamble, no explanation before or after ##TOOL_CALL##...##END_CALL##.\n")
 	b.WriteString("- Use EXACT action name from the list above.\n")
+	b.WriteString("- Use EXACT parameter names as listed in AVAILABLE ACTIONS.\n")
 	b.WriteString("- When NO action is needed, answer normally in plain text.\n")
 	b.WriteString("- Put arguments inside the input object as JSON.\n")
-	b.WriteString("- Do not invent tool names.\n\n")
+	b.WriteString("- Do not invent tool names.\n")
+	b.WriteString("- Each parameter must match its expected type.\n\n")
+
+	b.WriteString("VALIDATION CHECKLIST (before emitting ##TOOL_CALL##):\n")
+	b.WriteString("- All required parameters are present in the input object\n")
+	b.WriteString("- Parameter names match exactly (use names from AVAILABLE ACTIONS)\n")
+	b.WriteString("- Parameter types are correct (strings in quotes, numbers without quotes, booleans as true/false)\n")
+	b.WriteString("- No extra parameters beyond those listed in the schema\n\n")
+
+	b.WriteString("COMMON MISTAKES:\n")
+	b.WriteString("- Wrong: " + `{"input": {"path": "/file"}}` + " — use \"file_path\", not \"path\"\n")
+	b.WriteString("- Wrong: " + `{"input": {"command": 123}}` + " — use a string, not a number\n")
+	b.WriteString("- Wrong: " + `{"input": {}}` + " (missing required params)\n")
+	b.WriteString("- Wrong: extra params not in schema\n\n")
 
 	b.WriteString("CRITICAL — ABSOLUTELY FORBIDDEN OUTPUTS:\n")
 	b.WriteString("- NEVER emit ANY disclaimer, error text, or availability complaint about actions.\n")

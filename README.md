@@ -6,8 +6,10 @@ WebChat to API - A lightweight Go middleware that converts AI webchat interfaces
 
 - 🔌 **OpenAI API compatible** - Drop-in replacement for OpenAI API
 - 🌊 **Streaming support** - Server-Sent Events (SSE) for real-time responses
-- 🔐 **Automated login** - Automatically authenticates with DeepSeek webchat
-- 🔌 **Provider interface** - Easy to add more AI providers
+- 🔐 **Automated login** - Automatically authenticates with provider webchat
+- 🔌 **Multi-provider support** - DeepSeek and Qwen providers included
+- 🔧 **Tool call error correction** - Automatic parameter validation and retry with feedback
+- 📊 **Structured logging** - Debug tool call validation, corrections, and retry metrics
 
 ## Quick Start
 
@@ -40,15 +42,21 @@ Edit `config.json`:
       "enabled": true,
       "email": "your-email@example.com",
       "base_url": "https://chat.deepseek.com"
+    },
+    "qwen": {
+      "enabled": false,
+      "email": "your-email@example.com",
+      "base_url": "https://chat.qwen.ai"
     }
   }
 }
 ```
 
-**Security Note**: Set the password via environment variable instead of config file:
+**Security Note**: Set passwords via environment variables instead of config file:
 
 ```bash
 export DEEPSEEK_PASSWORD="your-password"
+export QWEN_PASSWORD="your-password"
 ```
 
 ### Building and Running Binary
@@ -119,9 +127,15 @@ Content-Type: application/json
 
 ## Supported Models
 
-- `deepseek-chat` - DeepSeek V3 general chat model
-- `deepseek-reasoner` - DeepSeek R1 reasoning model
-- `deepseek-coder` - DeepSeek Coder model
+### DeepSeek
+- `deepseek-v4-flash` - Fast general chat model (model_type: default)
+- `deepseek-v4-pro` - Expert model with enhanced capabilities (model_type: expert)
+- `deepseek-v4-flash-nothinking` / `deepseek-v4-pro-nothinking` - Disable thinking/reasoning
+
+### Qwen
+- `qwen3.5-flash` - Fast general chat model (model_type: default)
+- `qwen3.6-plus` - Enhanced model with more capabilities (model_type: expert)
+- `qwen3.5-flash-nothinking` / `qwen3.6-plus-nothinking` - Disable thinking/reasoning
 
 ## Configuration Options
 
@@ -148,12 +162,21 @@ wc2api
     ├─ HTTP Server (chi router)
     ├─ Auth Middleware
     ├─ OpenAI API Handlers
+    ├─ Tool Call Error Correction (Phases 1-7)
     └─ Provider Interface
          ↓
-    DeepSeek Provider
-         ↓ DeepSeek Web Protocol
-    chat.deepseek.com
+    DeepSeek Provider / Qwen Provider
+         ↓ Web Protocol
+    chat.deepseek.com / chat.qwen.ai
 ```
+
+## Documentation
+
+- [Tool Calls Documentation](docs/tool-calls.md) - How tool calling works, validation, and retry logic
+- [Error Correction Examples](docs/error-correction-examples.md) - Real-world examples of automatic parameter fixes
+- [API Documentation](docs/api.md) - Complete API reference with retry behavior
+- [Troubleshooting Guide](docs/troubleshooting.md) - Common issues and solutions
+- [Migration Guide](docs/migration-guide.md) - Upgrading to the latest version
 
 ## Development
 

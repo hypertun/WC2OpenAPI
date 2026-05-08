@@ -12,11 +12,22 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-chi/chi/v5/middleware"
 	providers "github.com/user/wc2api/internal/providers"
+	"github.com/user/wc2api/internal/toolcall"
 )
+
+const maxToolCallRetries = toolcall.DefaultMaxRetries
 
 // CreateChatCompletion creates a chat completion with Qwen
 func (c *Client) CreateChatCompletion(ctx context.Context, req *providers.ChatRequest) (*providers.ChatResponse, error) {
+	return c.chatWithRetry(ctx, req, 0)
+}
+
+func (c *Client) chatWithRetry(ctx context.Context, req *providers.ChatRequest, retryCount int) (*providers.ChatResponse, error) {
+	reqID := getReqID(ctx)
+	start := time.Now()
+
 	// Check if we need to refresh token
 	if err := c.ensureAuthenticated(); err != nil {
 		return nil, fmt.Errorf("failed to refresh token: %w", err)
@@ -68,6 +79,46 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req *providers.ChatRe
 
 	// Parse SSE content
 	content, toolCalls := parseSSEContent(string(body), req.Tools)
+
+	// Retry on invalid tool calls
+	validationErrors := validateToolCallsWithErrors(toolCalls, req.Tools)
+	if toolcall.ShouldRetry(validationErrors, retryCount, maxToolCallRetries) {
+		feedback := toolcall.GenerateToolCallErrorFeedback(validationErrors)
+		backoff := toolcall.CalculateBackoff(retryCount)
+
+		slog.Info("Retrying chat completion with error feedback",
+			"request_id", reqID,
+			"retry", retryCount+1,
+			"max", maxToolCallRetries,
+			"errors", len(validationErrors),
+			"validation_errors", validationErrors,
+			"backoff_ms", backoff.Milliseconds(),
+		)
+
+		time.Sleep(backoff)
+
+		retryReq := toolcall.BuildRetryRequest(req, feedback)
+		return c.chatWithRetry(ctx, retryReq, retryCount+1)
+	}
+
+	// Log retry outcome
+	if retryCount > 0 {
+		slog.Info("Retry succeeded",
+			"request_id", reqID,
+			"attempts", retryCount+1,
+			"duration_ms", time.Since(start).Milliseconds(),
+		)
+	}
+
+	// Log performance metrics
+	if retryCount > 0 || len(toolCalls) > 0 {
+		slog.Info("Tool call metrics",
+			"request_id", reqID,
+			"retry_count", retryCount,
+			"total_ms", time.Since(start).Milliseconds(),
+			"first_attempt_success", retryCount == 0,
+		)
+	}
 
 	// Build response
 	chatResp := &providers.ChatResponse{
@@ -167,6 +218,14 @@ func parseSSEContent(sseBody string, tools []providers.Tool) (string, []provider
 	}
 
 	if len(toolCalls) > 0 {
+		toolNames := make([]string, len(toolCalls))
+		for i, tc := range toolCalls {
+			toolNames[i] = tc.Function.Name
+		}
+		slog.Info("Tool calls received",
+			"count", len(toolCalls),
+			"tools", toolNames,
+		)
 		return "", toolCalls
 	}
 
@@ -175,6 +234,13 @@ func parseSSEContent(sseBody string, tools []providers.Tool) (string, []provider
 
 // CreateChatCompletionStream creates a streaming chat completion with Qwen
 func (c *Client) CreateChatCompletionStream(ctx context.Context, req *providers.ChatRequest) (<-chan providers.StreamResponse, error) {
+	return c.streamWithRetry(ctx, req, 0)
+}
+
+func (c *Client) streamWithRetry(ctx context.Context, req *providers.ChatRequest, retryCount int) (<-chan providers.StreamResponse, error) {
+	reqID := getReqID(ctx)
+	streamStart := time.Now()
+
 	// Check if we need to refresh token
 	if err := c.ensureAuthenticated(); err != nil {
 		return nil, fmt.Errorf("failed to refresh token: %w", err)
@@ -190,15 +256,17 @@ func (c *Client) CreateChatCompletionStream(ctx context.Context, req *providers.
 	payload := c.convertRequest(chatID, req)
 
 	// Create response channel
-	streamChan := make(chan providers.StreamResponse, 10)
+	outChan := make(chan providers.StreamResponse, 10)
+
+	needBuffer := len(req.Tools) > 0
 
 	go func() {
-		defer close(streamChan)
+		defer close(outChan)
+		validationStart := time.Now()
 
-		// Send request
 		httpReq, err := http.NewRequestWithContext(ctx, "POST", c.config.BaseURL+completionURL+"?chat_id="+chatID, bytes.NewReader(payload))
 		if err != nil {
-			streamChan <- providers.StreamResponse{
+			outChan <- providers.StreamResponse{
 				ID:     "",
 				Object: "error",
 				Model:  req.Model,
@@ -212,7 +280,6 @@ func (c *Client) CreateChatCompletionStream(ctx context.Context, req *providers.
 			return
 		}
 
-		// Set headers
 		httpReq.Header.Set("Authorization", "Bearer "+c.authToken)
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -224,7 +291,7 @@ func (c *Client) CreateChatCompletionStream(ctx context.Context, req *providers.
 
 		resp, err := c.httpClient.Do(httpReq)
 		if err != nil {
-			streamChan <- providers.StreamResponse{
+			outChan <- providers.StreamResponse{
 				ID:     "",
 				Object: "error",
 				Model:  req.Model,
@@ -240,7 +307,7 @@ func (c *Client) CreateChatCompletionStream(ctx context.Context, req *providers.
 		defer resp.Body.Close()
 
 		if resp.StatusCode != 200 {
-			streamChan <- providers.StreamResponse{
+			outChan <- providers.StreamResponse{
 				ID:     "",
 				Object: "error",
 				Model:  req.Model,
@@ -254,20 +321,18 @@ func (c *Client) CreateChatCompletionStream(ctx context.Context, req *providers.
 			return
 		}
 
-		// Parse SSE stream
 		reader := bufio.NewReader(resp.Body)
 		msgID := generateMessageID()
 		created := time.Now().Unix()
 
-		// Buffer to collect full response for tool call detection
 		var contentBuffer strings.Builder
 		var sawToolCallPhase bool
+		var allChunks []string
 
 		for {
 			line, err := reader.ReadString('\n')
 			if err != nil {
 				if err == io.EOF {
-					// Stream ended, process buffered content
 					break
 				}
 				slog.Error("Stream read error", "error", err)
@@ -278,72 +343,15 @@ func (c *Client) CreateChatCompletionStream(ctx context.Context, req *providers.
 			if line == "" {
 				continue
 			}
-
 			if !strings.HasPrefix(line, "data: ") {
 				continue
 			}
 
-		data := strings.TrimPrefix(line, "data: ")
-		if data == "[DONE]" {
-			// Stream ended with [DONE] marker
-			fullText := contentBuffer.String()
-			if sawToolCallPhase {
-				toolCalls, err := parseToolCallsFromText(fullText, req.Tools)
-				if err != nil {
-					slog.Debug("Failed to parse tool calls in stream", "error", err, "text", fullText[:min(len(fullText), 300)])
-				}
-				if len(toolCalls) > 0 {
-					streamChan <- providers.StreamResponse{
-						ID:      msgID,
-						Object:  "chat.completion.chunk",
-						Created: created,
-						Model:   req.Model,
-						Choices: []providers.StreamChoice{
-							{
-								Index: 0,
-								Delta: providers.Delta{
-									ToolCalls: toolCalls,
-								},
-								FinishReason: stringPtr("tool_calls"),
-							},
-						},
-					}
-				} else {
-					finishReason := "stop"
-					streamChan <- providers.StreamResponse{
-						ID:      msgID,
-						Object:  "chat.completion.chunk",
-						Created: created,
-						Model:   req.Model,
-						Choices: []providers.StreamChoice{
-							{
-								Index:        0,
-								Delta:        providers.Delta{},
-								FinishReason: &finishReason,
-							},
-						},
-					}
-				}
-			} else {
-				finishReason := "stop"
-				streamChan <- providers.StreamResponse{
-					ID:      msgID,
-					Object:  "chat.completion.chunk",
-					Created: created,
-					Model:   req.Model,
-					Choices: []providers.StreamChoice{
-						{
-							Index:        0,
-							Delta:        providers.Delta{},
-							FinishReason: &finishReason,
-						},
-					},
-				}
+			data := strings.TrimPrefix(line, "data: ")
+			if data == "[DONE]" {
+				break
 			}
-			return
-		}
 
-			// Parse SSE event
 			var evt struct {
 				Choices []struct {
 					Delta struct {
@@ -367,34 +375,11 @@ func (c *Client) CreateChatCompletionStream(ctx context.Context, req *providers.
 			phase := delta.Phase
 			contentStr := delta.Content
 
-			// Handle different phases
 			switch phase {
-		case "think", "thinking_summary":
-			// Reasoning content - buffer for tool call detection and stream immediately
-			contentBuffer.WriteString(contentStr)
-			streamChan <- providers.StreamResponse{
-					ID:      msgID,
-					Object:  "chat.completion.chunk",
-					Created: created,
-					Model:   req.Model,
-					Choices: []providers.StreamChoice{
-						{
-							Index: 0,
-							Delta: providers.Delta{
-								Content: contentStr,
-							},
-						},
-					},
-				}
-		case "tool_call":
-			// Native tool call - mark phase and buffer for tool call detection only (do not stream to client)
-			sawToolCallPhase = true
-			contentBuffer.WriteString(contentStr)
-			default: // "answer" or empty
-				if contentStr != "" {
-					contentBuffer.WriteString(contentStr)
-					// Send immediately to prevent timeout
-					streamChan <- providers.StreamResponse{
+			case "think", "thinking_summary":
+				contentBuffer.WriteString(contentStr)
+				if !needBuffer {
+					outChan <- providers.StreamResponse{
 						ID:      msgID,
 						Object:  "chat.completion.chunk",
 						Created: created,
@@ -402,26 +387,108 @@ func (c *Client) CreateChatCompletionStream(ctx context.Context, req *providers.
 						Choices: []providers.StreamChoice{
 							{
 								Index: 0,
-								Delta: providers.Delta{
-									Content: contentStr,
-								},
+								Delta: providers.Delta{Content: contentStr},
 							},
 						},
+					}
+				} else {
+					allChunks = append(allChunks, contentStr)
+				}
+			case "tool_call":
+				sawToolCallPhase = true
+				contentBuffer.WriteString(contentStr)
+			default:
+				if contentStr != "" {
+					contentBuffer.WriteString(contentStr)
+					if !needBuffer {
+						outChan <- providers.StreamResponse{
+							ID:      msgID,
+							Object:  "chat.completion.chunk",
+							Created: created,
+							Model:   req.Model,
+							Choices: []providers.StreamChoice{
+								{
+									Index: 0,
+									Delta: providers.Delta{Content: contentStr},
+								},
+							},
+						}
+					} else {
+						allChunks = append(allChunks, contentStr)
 					}
 				}
 			}
 		}
 
-	// Process buffered content at end of stream (EOF)
-	fullText := contentBuffer.String()
-	slog.Debug("Stream end processing", "sawToolCallPhase", sawToolCallPhase, "buffer_len", len(fullText))
-		if sawToolCallPhase {
-			toolCalls, err := parseToolCallsFromText(fullText, req.Tools)
-			if err != nil {
-				slog.Debug("Failed to parse tool calls in stream", "error", err, "text", fullText[:min(len(fullText), 300)])
+		fullText := contentBuffer.String()
+		slog.Debug("Stream end processing", "sawToolCallPhase", sawToolCallPhase, "buffer_len", len(fullText))
+
+		toolCalls, parseErr := parseToolCallsFromText(fullText, req.Tools)
+
+		// Log original tool call structure
+		if len(toolCalls) > 0 {
+			toolNames := make([]string, len(toolCalls))
+			for i, tc := range toolCalls {
+				toolNames[i] = tc.Function.Name
 			}
-			if len(toolCalls) > 0 {
-				streamChan <- providers.StreamResponse{
+			slog.Info("Tool calls received",
+				"request_id", reqID,
+				"count", len(toolCalls),
+				"tools", toolNames,
+			)
+		}
+
+		validationErrors := validateToolCallsWithErrors(toolCalls, req.Tools)
+		if parseErr == nil && toolcall.ShouldRetry(validationErrors, retryCount, maxToolCallRetries) {
+			feedback := toolcall.GenerateToolCallErrorFeedback(validationErrors)
+			backoff := toolcall.CalculateBackoff(retryCount)
+
+			slog.Info("Retrying stream with error feedback",
+				"request_id", reqID,
+				"retry", retryCount+1,
+				"max", maxToolCallRetries,
+				"errors", len(validationErrors),
+				"validation_errors", validationErrors,
+				"backoff_ms", backoff.Milliseconds(),
+			)
+
+			time.Sleep(backoff)
+
+			retryReq := toolcall.BuildRetryRequest(req, feedback)
+			retryChan, retryErr := c.streamWithRetry(ctx, retryReq, retryCount+1)
+			if retryErr == nil {
+				slog.Info("Stream retry succeeded",
+					"request_id", reqID,
+					"attempts", retryCount+1,
+					"duration_ms", time.Since(streamStart).Milliseconds(),
+				)
+				for chunk := range retryChan {
+					outChan <- chunk
+				}
+				return
+			}
+			slog.Error("Retry failed, falling back",
+				"request_id", reqID,
+				"error", retryErr,
+			)
+		}
+
+		// Log performance metrics
+		if retryCount > 0 || len(toolCalls) > 0 {
+			slog.Info("Tool call metrics",
+				"request_id", reqID,
+				"validation_ms", time.Since(validationStart).Milliseconds(),
+				"retry_count", retryCount,
+				"total_ms", time.Since(streamStart).Milliseconds(),
+				"first_attempt_success", retryCount == 0,
+			)
+		}
+
+		// Send response: either replay buffered chunks or send final chunk
+		if needBuffer && !sawToolCallPhase {
+			// Tools present but no tool call phase — replay buffered content
+			for _, chunk := range allChunks {
+				outChan <- providers.StreamResponse{
 					ID:      msgID,
 					Object:  "chat.completion.chunk",
 					Created: created,
@@ -429,49 +496,54 @@ func (c *Client) CreateChatCompletionStream(ctx context.Context, req *providers.
 					Choices: []providers.StreamChoice{
 						{
 							Index: 0,
-							Delta: providers.Delta{
-								ToolCalls: toolCalls,
-							},
-							FinishReason: stringPtr("tool_calls"),
-						},
-					},
-				}
-			} else {
-				finishReason := "stop"
-				streamChan <- providers.StreamResponse{
-					ID:      msgID,
-					Object:  "chat.completion.chunk",
-					Created: created,
-					Model:   req.Model,
-					Choices: []providers.StreamChoice{
-						{
-							Index:        0,
-							Delta:        providers.Delta{},
-							FinishReason: &finishReason,
+							Delta: providers.Delta{Content: chunk},
 						},
 					},
 				}
 			}
-		} else {
-			// No tool calls expected; just send finish (content already streamed)
 			finishReason := "stop"
-			streamChan <- providers.StreamResponse{
+			outChan <- providers.StreamResponse{
+				ID:      msgID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   req.Model,
+				Choices: []providers.StreamChoice{
+					{Index: 0, Delta: providers.Delta{}, FinishReason: &finishReason},
+				},
+			}
+		} else if sawToolCallPhase && len(toolCalls) > 0 {
+			// Tool calls detected — send single tool call chunk
+			outChan <- providers.StreamResponse{
 				ID:      msgID,
 				Object:  "chat.completion.chunk",
 				Created: created,
 				Model:   req.Model,
 				Choices: []providers.StreamChoice{
 					{
-						Index:        0,
-						Delta:        providers.Delta{},
-						FinishReason: &finishReason,
+						Index: 0,
+						Delta: providers.Delta{
+							ToolCalls: toolCalls,
+						},
+						FinishReason: stringPtr("tool_calls"),
 					},
+				},
+			}
+		} else {
+			// No tool calls, content already streamed (or empty)
+			finishReason := "stop"
+			outChan <- providers.StreamResponse{
+				ID:      msgID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   req.Model,
+				Choices: []providers.StreamChoice{
+					{Index: 0, Delta: providers.Delta{}, FinishReason: &finishReason},
 				},
 			}
 		}
 	}()
 
-	return streamChan, nil
+	return outChan, nil
 }
 
 
@@ -607,6 +679,13 @@ func (c *Client) formatMessagesToPrompt(messages []providers.Message) string {
 
 func generateMessageID() string {
 	return fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+}
+
+func getReqID(ctx context.Context) string {
+	if reqID := middleware.GetReqID(ctx); reqID != "" {
+		return reqID
+	}
+	return "unknown"
 }
 
 func stringPtr(s string) *string {

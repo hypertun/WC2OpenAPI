@@ -69,6 +69,36 @@ func parseToolCallsFromText(text string, tools []providers.Tool) ([]providers.To
 	return toolCalls, nil
 }
 
+// validateToolCallsWithErrors validates tool calls and returns validation errors
+func validateToolCallsWithErrors(calls []providers.ToolCall, tools []providers.Tool) []*toolcall.ValidationError {
+	var allErrors []*toolcall.ValidationError
+	if len(tools) == 0 {
+		return nil
+	}
+	for _, call := range calls {
+		var args map[string]interface{}
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
+			continue
+		}
+		for _, t := range tools {
+			if t.Function.Name == call.Function.Name {
+				if t.Function.Parameters != nil {
+					schemaJSON, err := json.Marshal(t.Function.Parameters)
+					if err != nil {
+						continue
+					}
+					result := toolcall.ValidateToolCall(call.Function.Name, args, string(schemaJSON))
+					if result.HasErrors() {
+						allErrors = append(allErrors, result.Errors...)
+					}
+				}
+				break
+			}
+		}
+	}
+	return allErrors
+}
+
 // validateToolCall validates a tool call against provided tool definitions
 func validateToolCall(name string, input map[string]any, tools []providers.Tool) {
 	// Find matching tool definition
@@ -81,12 +111,11 @@ func validateToolCall(name string, input map[string]any, tools []providers.Tool)
 					return
 				}
 				result := toolcall.ValidateToolCall(name, input, string(schemaJSON))
-				if result.HasErrors() {
-					slog.Warn("Tool call validation failed",
-						"tool", name,
-						"error_count", len(result.Errors),
-						"errors", result.Errors)
-				}
+				slog.Info("Validation result",
+					"tool", name,
+					"valid", !result.HasErrors(),
+					"error_count", len(result.Errors),
+					"errors", result.Errors)
 			}
 			break
 		}

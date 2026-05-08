@@ -2,7 +2,10 @@ package toolcall
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
+
+	"github.com/user/wc2api/internal/providers"
 )
 
 func TestParseToolCalls(t *testing.T) {
@@ -140,9 +143,28 @@ func TestParseToolCalls(t *testing.T) {
 	}
 }
 
+func makeTool(name, desc string, props map[string]interface{}, req []interface{}) providers.Tool {
+	return providers.Tool{
+		Type: "function",
+		Function: providers.ToolFunction{
+			Name:        name,
+			Description: desc,
+			Parameters: map[string]interface{}{
+				"type":       "object",
+				"properties": props,
+				"required":   req,
+			},
+		},
+	}
+}
+
 func TestBuildToolCallInstructions(t *testing.T) {
-	toolNames := []string{"bash", "read_file", "write_file"}
-	instructions := BuildToolCallInstructions(toolNames)
+	tools := []providers.Tool{
+		makeTool("bash", "run a shell command",
+			map[string]interface{}{"command": map[string]interface{}{"type": "string"}},
+			[]interface{}{"command"}),
+	}
+	instructions := BuildToolCallInstructions(tools)
 
 	if instructions == "" {
 		t.Error("expected non-empty instructions")
@@ -152,6 +174,40 @@ func TestBuildToolCallInstructions(t *testing.T) {
 	}
 	if !contains(instructions, "bash") {
 		t.Error("expected tool name in instructions")
+	}
+	if !contains(instructions, "command") {
+		t.Error("expected parameter name in instructions")
+	}
+	if !contains(instructions, "string") {
+		t.Error("expected parameter type in instructions")
+	}
+}
+
+func TestBuildQwenToolCallInstructions(t *testing.T) {
+	tools := []providers.Tool{
+		makeTool("Read", "read a file",
+			map[string]interface{}{"file_path": map[string]interface{}{"type": "string"}},
+			[]interface{}{"file_path"}),
+	}
+	instructions := BuildQwenToolCallInstructions(tools)
+
+	if instructions == "" {
+		t.Error("expected non-empty instructions")
+	}
+	if !strings.Contains(instructions, "##TOOL_CALL##") {
+		t.Error("expected TOOL_CALL marker")
+	}
+	if !strings.Contains(instructions, "Read") {
+		t.Error("expected tool name in instructions")
+	}
+	if !strings.Contains(instructions, "file_path") {
+		t.Error("expected parameter name in instructions")
+	}
+	if !strings.Contains(instructions, "required") {
+		t.Error("expected required marker in instructions")
+	}
+	if !strings.Contains(instructions, "VALIDATION CHECKLIST") {
+		t.Errorf("expected VALIDATION CHECKLIST in instructions, got:\n%s", instructions)
 	}
 }
 
