@@ -9,10 +9,58 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"runtime"
 	"strings"
 
 	"github.com/dop251/goja"
 )
+
+// findChromiumBrowser searches for any available Chromium-based browser
+func findChromiumBrowser() string {
+	var candidates []string
+
+	switch runtime.GOOS {
+	case "darwin": // macOS
+		candidates = []string{
+			"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+			"/Applications/Chromium.app/Contents/MacOS/Chromium",
+			"/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+			"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+			"/Applications/Opera.app/Contents/MacOS/Opera",
+		}
+	case "windows":
+		candidates = []string{
+			"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+			"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+			"C:\\Program Files\\Chromium\\Application\\chrome.exe",
+			"C:\\Program Files (x86)\\Chromium\\Application\\chrome.exe",
+			"C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+			"C:\\Program Files (x86)\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+			"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+			"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+			"C:\\Program Files\\Opera\\opera.exe",
+		}
+	case "linux":
+		candidates = []string{
+			"/usr/bin/google-chrome",
+			"/usr/bin/chromium-browser",
+			"/usr/bin/chromium",
+			"/snap/bin/chromium",
+			"/usr/bin/brave-browser",
+			"/usr/bin/microsoft-edge",
+			"/usr/bin/opera",
+		}
+	}
+
+	for _, path := range candidates {
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+	}
+
+	return ""
+}
 
 func (c *Client) getVQD(ctx context.Context) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL.String()+statusURL, nil)
@@ -87,17 +135,29 @@ func (c *Client) computeVqdHash(scriptB64 string) (string, error) {
 						}
 					};
 				},
-				head: { appendChild: function() {} },
-				createElement: function() { return { setAttribute: function() {} }; }
+				head: { appendChild: function() {}, removeChild: function() {} },
+				body: { appendChild: function() {}, removeChild: function() {} },
+				createElement: function(tag) { 
+					return { 
+						setAttribute: function() {}, 
+						appendChild: function() {}, 
+						removeChild: function() {},
+						getAttribute: function() { return ''; }
+					}; 
+				}
 			},
-			contentWindow: { Proxy: function Proxy() {}, get: function() {} },
+			contentWindow: { 
+				Proxy: function Proxy() {},
+				document: null
+			},
 			getAttribute: function(a) { return a === 'sandbox' ? 'allow-scripts allow-same-origin' : ''; },
 			sandbox: { add: function() {} },
 			srcdoc: ''
 		})`)
 		iframeObj := iframe.(*goja.Object)
 		contentWindow := iframeObj.Get("contentWindow").(*goja.Object)
-		contentWindow.Set("document", iframeObj.Get("contentDocument"))
+		contentDocument := iframeObj.Get("contentDocument")
+		contentWindow.Set("document", contentDocument)
 		return iframe
 	})
 
@@ -106,23 +166,55 @@ func (c *Client) computeVqdHash(scriptB64 string) (string, error) {
 var document = {
 	createElement: function(tag) {
 		if (tag === 'iframe') return __makeIframe();
-		if (tag === 'div') return {
-			__innerHTML: '',
-			get innerHTML() { return this.__innerHTML; },
-			set innerHTML(v) { this.__innerHTML = v; },
-			querySelectorAll: function(sel) {
-				var html = this.__innerHTML, count = 0, i = 0;
-				while(i < html.length-1) {
-					if(html[i]==='<' && html[i+1]!=='/') count++;
-					i++;
+		if (tag === 'div') {
+			var divObj = {
+				_innerHTML: '',
+				attributes: {},
+				setAttribute: function(k, v) { this.attributes[k] = v; },
+				getAttribute: function(k) { return this.attributes[k] || ''; },
+				appendChild: function(child) { return child; },
+				removeChild: function(child) { return child; },
+				querySelectorAll: function(sel) {
+					var html = this._innerHTML, count = 0, i = 0;
+					if (typeof html === 'string') {
+						while(i < html.length-1) {
+							if(html[i]==='<' && html[i+1]!=='/') count++;
+							i++;
+						}
+					}
+					return { length: count };
 				}
-				return { length: count };
-			}
+			};
+			// Use Object.defineProperty for reliable getter/setter
+			Object.defineProperty(divObj, 'innerHTML', {
+				get: function() { return this._innerHTML; },
+				set: function(v) { this._innerHTML = v || ''; },
+				enumerable: true,
+				configurable: true
+			});
+			return divObj;
+		}
+		var genericEl = {
+			attributes: {},
+			setAttribute: function(k, v) { this.attributes[k] = v; },
+			getAttribute: function(k) { return this.attributes[k] || ''; },
+			appendChild: function(child) { return child; },
+			removeChild: function(child) { return child; }
 		};
-		return { setAttribute: function(){}, appendChild: function(){} };
+		return genericEl;
 	},
-	querySelector: function(sel) { return sel === '#jsa' ? __makeIframe() : null; },
-	body: { appendChild: function(){}, removeChild: function(){} }
+	querySelector: function(sel) { 
+		if (sel === '#jsa') return __makeIframe(); 
+		return null; 
+	},
+	querySelectorAll: function(sel) {
+		return { length: 0 };
+	},
+	body: { 
+		appendChild: function(){}, 
+		removeChild: function(){},
+		attributes: {}
+	}
 };
 var window = globalThis;
 window.__DDG_BE_VERSION__ = 1;
@@ -167,6 +259,10 @@ var __vqd_error = null;
 
 	resultJSON := resultVal.String()
 
+	// Debug: Log the raw result from the script before processing
+	slog.Debug("VQD script raw result",
+		"raw_json", resultJSON)
+
 	// Parse result into map to preserve array values
 	var rawResult map[string]json.RawMessage
 	err = json.Unmarshal([]byte(resultJSON), &rawResult)
@@ -203,6 +299,15 @@ var __vqd_error = null;
 
 	resultB64 := base64.StdEncoding.EncodeToString(encoded)
 
+	// Debug: Log the final encoded JSON
+	ch0Prefix := "too_short"
+	if len(scriptResult.ClientHashes) > 0 && len(scriptResult.ClientHashes[0]) > 20 {
+		ch0Prefix = scriptResult.ClientHashes[0][:20]
+	}
+	slog.Debug("VQD final result before base64",
+		"final_json", string(encoded),
+		"client_hashes_0_prefix", ch0Prefix)
+
 	// Log details for debugging
 	cid := scriptResult.Meta.ChallengeID
 	if len(cid) > 30 {
@@ -232,7 +337,6 @@ var __vqd_error = null;
 
 	return resultB64, nil
 }
-
 
 func setCommonHeaders(req *http.Request) {
 	ua := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
