@@ -363,19 +363,7 @@ func (c *Client) doChatRequest(ctx context.Context, vqdHash string, body map[str
 	req.Header.Set("x-vqd-hash-1", vqdHash)
 	req.Header.Set("accept", "text/event-stream")
 
-	slog.Debug("Sending chat request",
-		"vqd_hash_len", len(vqdHash),
-		"vqd_hash_preview", vqdHash[:min(50, len(vqdHash))],
-		"user_agent", req.Header.Get("User-Agent"))
-
 	return c.httpClient.Do(req)
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 func parseSSE(body string, checkTools bool) (string, []providers.ToolCall) {

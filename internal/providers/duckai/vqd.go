@@ -9,74 +9,10 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
-	"runtime"
 	"strings"
-	"time"
 
-	"github.com/chromedp/chromedp"
+	"github.com/dop251/goja"
 )
-
-// findChromiumBrowser searches for any available Chromium-based browser
-func findChromiumBrowser() string {
-	var candidates []string
-
-	switch runtime.GOOS {
-	case "darwin": // macOS
-		candidates = []string{
-			"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-			"/Applications/Chromium.app/Contents/MacOS/Chromium",
-			"/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-			"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-			"/Applications/Opera.app/Contents/MacOS/Opera",
-		}
-	case "windows":
-		candidates = []string{
-			"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-			"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
-			"C:\\Program Files\\Chromium\\Application\\chrome.exe",
-			"C:\\Program Files (x86)\\Chromium\\Application\\chrome.exe",
-			"C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
-			"C:\\Program Files (x86)\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
-			"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
-			"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
-			"C:\\Program Files\\Opera\\opera.exe",
-		}
-	case "linux":
-		candidates = []string{
-			"/usr/bin/google-chrome",
-			"/usr/bin/chromium-browser",
-			"/usr/bin/chromium",
-			"/snap/bin/chromium",
-			"/usr/bin/brave-browser",
-			"/usr/bin/microsoft-edge",
-			"/usr/bin/opera",
-		}
-	}
-
-	for _, path := range candidates {
-		if _, err := os.Stat(path); err == nil {
-			return path
-		}
-	}
-
-	return ""
-}
-
-// getKeys returns the keys from a map as a slice of strings (for debug logging)
-func getKeys(m map[string]interface{}) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	return keys
-}
-
-// jsonStringify converts a string to a JSON-quoted string for safe JavaScript embedding
-func jsonStringify(s string) string {
-	b, _ := json.Marshal(s)
-	return string(b)
-}
 
 func (c *Client) getVQD(ctx context.Context) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL.String()+statusURL, nil)
@@ -106,6 +42,21 @@ func (c *Client) getVQD(ctx context.Context) (string, error) {
 	return c.computeVqdHash(hashHeader)
 }
 
+// vqdScriptResult represents the structure returned by the DDG VQD script
+type vqdScriptResult struct {
+	ServerHashes []string      `json:"server_hashes"`
+	ClientHashes []string      `json:"client_hashes"`
+	Signals      interface{}   `json:"signals"`
+	Meta         vqdMeta       `json:"meta"`
+}
+
+type vqdMeta struct {
+	V           string `json:"v"`
+	ChallengeID string `json:"challenge_id"`
+	Timestamp   string `json:"timestamp"`
+	Debug       string `json:"debug"`
+}
+
 func (c *Client) computeVqdHash(scriptB64 string) (string, error) {
 	jsScript, err := base64.StdEncoding.DecodeString(scriptB64)
 	if err != nil {
@@ -114,200 +65,172 @@ func (c *Client) computeVqdHash(scriptB64 string) (string, error) {
 
 	scriptStr := string(jsScript)
 
-	// Use chromedp to execute the script in a real browser environment
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	// Create goja VM
+	vm := goja.New()
+	global := vm.GlobalObject()
 
-	// Find an available Chromium-based browser
-	browserPath := findChromiumBrowser()
-	if browserPath == "" {
-		return "", fmt.Errorf("no Chromium-based browser found (Chrome, Edge, Brave, Opera, Chromium). Please install one to enable VQD hash computation")
-	}
+	// Set navigator object with UA and webdriver=false
+	navigatorObj, _ := vm.RunString(`({
+		userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+		webdriver: false
+	})`)
+	global.Set("navigator", navigatorObj)
 
-	// Create chromedp allocator with the found browser
-	allocatorCtx, cancel := chromedp.NewExecAllocator(ctx,
-		chromedp.ExecPath(browserPath),
-		chromedp.NoFirstRun,
-		chromedp.NoDefaultBrowserCheck,
-		chromedp.DisableGPU,
-		chromedp.Flag("headless", "new"),
-	)
-	defer cancel()
+	// Register __makeIframe helper function
+	global.Set("__makeIframe", func(call goja.FunctionCall) goja.Value {
+		iframe, _ := vm.RunString(`({
+			contentDocument: {
+				querySelector: function(sel) {
+					return {
+						getAttribute: function(a) {
+							return a === 'content' ? "default-src 'none'; script-src 'unsafe-inline';" : '';
+						}
+					};
+				},
+				head: { appendChild: function() {} },
+				createElement: function() { return { setAttribute: function() {} }; }
+			},
+			contentWindow: { Proxy: function Proxy() {}, get: function() {} },
+			getAttribute: function(a) { return a === 'sandbox' ? 'allow-scripts allow-same-origin' : ''; },
+			sandbox: { add: function() {} },
+			srcdoc: ''
+		})`)
+		iframeObj := iframe.(*goja.Object)
+		contentWindow := iframeObj.Get("contentWindow").(*goja.Object)
+		contentWindow.Set("document", iframeObj.Get("contentDocument"))
+		return iframe
+	})
 
-	allocCtx, cancel := chromedp.NewContext(allocatorCtx)
-	defer cancel()
-
-	// Navigate to about:blank first
-	err = chromedp.Run(allocCtx,
-		chromedp.Navigate("about:blank"),
-	)
-	if err != nil {
-		slog.Warn("VQD script navigation failed via chromedp",
-			"error", err.Error(),
-			"browser_path", browserPath)
-		return "", fmt.Errorf("VQD script navigation failed: %w", err)
-	}
-
-	// Inject the HTML with the iframe and set up globals and result containers
-	// We create the iframe with sandbox attribute and srcdoc containing minimal HTML
-	iframeHTML := `<!DOCTYPE html><html><head><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'"></head><body></body></html>`
-	
-	injectHTMLScript := fmt.Sprintf(`
-		// Create iframe element
-		const iframe = document.createElement('iframe');
-		iframe.id = 'jsa';
-		iframe.sandbox.add('allow-scripts');
-		iframe.sandbox.add('allow-same-origin');
-		iframe.style.position = 'absolute';
-		iframe.style.left = '-9999px';
-		iframe.style.top = '-9999px';
-		// Set srcdoc to minimal HTML with CSP meta tag
-		iframe.srcdoc = %s;
-		document.body.appendChild(iframe);
-		
-		// Set up window globals
-		window.__DDG_BE_VERSION__ = 1;
-		window.__DDG_FE_CHAT_HASH__ = 1;
-		window.__vqdResult = null;
-		window.__vqdError = null;
-	`, jsonStringify(iframeHTML))
-
-	err = chromedp.Run(allocCtx,
-		chromedp.Evaluate(injectHTMLScript, nil),
-	)
-	if err != nil {
-		slog.Warn("VQD HTML injection failed via chromedp",
-			"error", err.Error(),
-			"browser_path", browserPath)
-		return "", fmt.Errorf("VQD HTML injection failed: %w", err)
-	}
-
-	// Give the DOM a moment to settle for iframe srcdoc to be processed
-	time.Sleep(200 * time.Millisecond)
-
-	// Now inject and run the DDG script
-	runVQDScript := fmt.Sprintf(`
-		(async function() {
-			try {
-				window.__vqdResult = await (%s);
-			} catch(e) {
-				window.__vqdError = e.toString();
-			}
-		})();
-	`, scriptStr)
-
-	err = chromedp.Run(allocCtx,
-		chromedp.Evaluate(runVQDScript, nil),
-	)
-	if err != nil {
-		slog.Warn("VQD script execution failed via chromedp",
-			"error", err.Error(),
-			"browser_path", browserPath)
-		return "", fmt.Errorf("VQD script execution failed: %w", err)
-	}
-
-	// Poll for the async script result (up to 5 seconds)
-	maxWaitTime := 5 * time.Second
-	pollInterval := 100 * time.Millisecond
-	startTime := time.Now()
-
-	for time.Since(startTime) < maxWaitTime {
-		var result interface{}
-		var errMsg string
-
-		// Check for error first
-		errErr := chromedp.Run(allocCtx,
-			chromedp.Evaluate("window.__vqdError", &errMsg),
-		)
-		if errErr != nil {
-			slog.Debug("Error checking window.__vqdError",
-				"error", errErr.Error())
-		} else if errMsg != "" {
-			slog.Warn("VQD script execution error",
-				"error", errMsg,
-				"browser_path", browserPath)
-			return "", fmt.Errorf("VQD script execution error: %s", errMsg)
-		}
-
-		// Check for result
-		resErr := chromedp.Run(allocCtx,
-			chromedp.Evaluate("window.__vqdResult", &result),
-		)
-		if resErr == nil && result != nil {
-			// Result is ready, parse it
-			slog.Debug("VQD script result retrieved",
-				"result_type", fmt.Sprintf("%T", result),
-				"result_value", fmt.Sprintf("%v", result))
-
-			resultMap, ok := result.(map[string]interface{})
-			if !ok {
-				slog.Debug("VQD result is not a map", "type", fmt.Sprintf("%T", result), "value", result)
-				return "", fmt.Errorf("VQD script returned unexpected type: %T", result)
-			}
-
-			clientHashesRaw, ok := resultMap["client_hashes"]
-			if !ok {
-				slog.Debug("VQD result keys", "keys", getKeys(resultMap))
-				return "", fmt.Errorf("VQD result missing client_hashes")
-			}
-
-			// Handle both []interface{} and []string
-			var clientHashes []string
-			switch v := clientHashesRaw.(type) {
-			case []interface{}:
-				clientHashes = make([]string, len(v))
-				for i, item := range v {
-					clientHashes[i] = fmt.Sprintf("%v", item)
+	// Define document, window, and browser mocking setup
+	setupScript := `
+var document = {
+	createElement: function(tag) {
+		if (tag === 'iframe') return __makeIframe();
+		if (tag === 'div') return {
+			__innerHTML: '',
+			get innerHTML() { return this.__innerHTML; },
+			set innerHTML(v) { this.__innerHTML = v; },
+			querySelectorAll: function(sel) {
+				var html = this.__innerHTML, count = 0, i = 0;
+				while(i < html.length-1) {
+					if(html[i]==='<' && html[i+1]!=='/') count++;
+					i++;
 				}
-			case []string:
-				clientHashes = v
-			default:
-				slog.Debug("VQD client_hashes type", "type", fmt.Sprintf("%T", clientHashesRaw))
-				return "", fmt.Errorf("VQD client_hashes is unexpected type: %T", clientHashesRaw)
+				return { length: count };
 			}
+		};
+		return { setAttribute: function(){}, appendChild: function(){} };
+	},
+	querySelector: function(sel) { return sel === '#jsa' ? __makeIframe() : null; },
+	body: { appendChild: function(){}, removeChild: function(){} }
+};
+var window = globalThis;
+window.__DDG_BE_VERSION__ = 1;
+window.__DDG_FE_CHAT_HASH__ = 1;
+window.top = window;
+window.self = window;
+window.document = document;
+var __origKeys = Object.keys;
+Object.keys = function(obj) {
+	if (obj === window) return ['__DDG_BE_VERSION__', '__DDG_FE_CHAT_HASH__'];
+	return __origKeys(obj);
+};
+`
 
-			if len(clientHashes) == 0 {
-				return "", fmt.Errorf("VQD returned empty client_hashes")
-			}
-
-			// Update first hash to Chrome user agent
-			chromeUA := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
-			clientHashes[0] = chromeUA
-
-			// SHA256 hash each client hash
-			hashed := make([]string, len(clientHashes))
-			for i, h := range clientHashes {
-				sum := sha256.Sum256([]byte(h))
-				hashed[i] = base64.StdEncoding.EncodeToString(sum[:])
-			}
-
-			out := map[string]interface{}{
-				"client_hashes": hashed,
-			}
-
-			// Copy other fields from result
-			for _, k := range []string{"vqd", "dict", "server_hashes", "signals", "meta"} {
-				if v, ok := resultMap[k]; ok {
-					out[k] = v
-				}
-			}
-
-			encoded, err := json.Marshal(out)
-			if err != nil {
-				return "", fmt.Errorf("failed to marshal VQD result: %w", err)
-			}
-
-			return base64.StdEncoding.EncodeToString(encoded), nil
-		}
-
-		// Not ready yet, wait and retry
-		time.Sleep(pollInterval)
+	_, err = vm.RunString(setupScript)
+	if err != nil {
+		return "", fmt.Errorf("failed to setup goja environment: %w", err)
 	}
 
-	// Timeout waiting for result
-	slog.Warn("VQD script result retrieval timed out via chromedp",
-		"browser_path", browserPath)
-	return "", fmt.Errorf("VQD script result retrieval timed out after %v", maxWaitTime)
+	// Wrap script execution with promise handler
+	wrappedScript := fmt.Sprintf(`
+var __vqd_result = null;
+var __vqd_error = null;
+(%s).then(function(r) { __vqd_result = JSON.stringify(r); })
+	.catch(function(e) { __vqd_error = e.toString(); });
+`, scriptStr)
+
+	_, err = vm.RunString(wrappedScript)
+	if err != nil {
+		return "", fmt.Errorf("failed to execute VQD script: %w", err)
+	}
+
+	// Extract result
+	resultVal := vm.Get("__vqd_result")
+	if resultVal == nil || goja.IsUndefined(resultVal) || goja.IsNull(resultVal) {
+		errVal := vm.Get("__vqd_error")
+		if errVal != nil && !goja.IsUndefined(errVal) {
+			return "", fmt.Errorf("VQD script execution error: %v", errVal)
+		}
+		return "", fmt.Errorf("VQD script produced no result")
+	}
+
+	resultJSON := resultVal.String()
+
+	// Parse result into map to preserve array values
+	var rawResult map[string]json.RawMessage
+	err = json.Unmarshal([]byte(resultJSON), &rawResult)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse VQD script result: %w", err)
+	}
+
+	// Build proper result structure
+	var scriptResult vqdScriptResult
+	err = json.Unmarshal([]byte(resultJSON), &scriptResult)
+	if err != nil {
+		return "", fmt.Errorf("failed to unmarshal VQD result: %w", err)
+	}
+
+	// Replace client_hashes[0] with Chrome UA
+	chromeUA := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+	if len(scriptResult.ClientHashes) > 0 {
+		scriptResult.ClientHashes[0] = chromeUA
+	}
+
+	// SHA256-hash all client_hashes
+	hashedHashes := make([]string, len(scriptResult.ClientHashes))
+	for i, h := range scriptResult.ClientHashes {
+		sum := sha256.Sum256([]byte(h))
+		hashedHashes[i] = base64.StdEncoding.EncodeToString(sum[:])
+	}
+	scriptResult.ClientHashes = hashedHashes
+
+	// Serialize to JSON with ordered fields
+	encoded, err := json.Marshal(scriptResult)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal VQD result: %w", err)
+	}
+
+	resultB64 := base64.StdEncoding.EncodeToString(encoded)
+
+	// Log details for debugging
+	cid := scriptResult.Meta.ChallengeID
+	if len(cid) > 30 {
+		cid = cid[:30] + "..."
+	}
+	sh0 := ""
+	if len(scriptResult.ServerHashes) > 0 {
+		sh0 = scriptResult.ServerHashes[0]
+		if len(sh0) > 20 {
+			sh0 = sh0[:20] + "..."
+		}
+	}
+	b64pre := resultB64
+	if len(b64pre) > 50 {
+		b64pre = b64pre[:50]
+	}
+
+	slog.Debug("VQD hash computed",
+		"encoded_json_len", len(encoded),
+		"b64_len", len(resultB64),
+		"server_hashes_count", len(scriptResult.ServerHashes),
+		"client_hashes_count", len(scriptResult.ClientHashes),
+		"server_hashes[0]", sh0,
+		"challenge_id", cid,
+		"timestamp", scriptResult.Meta.Timestamp,
+		"b64_preview", b64pre)
+
+	return resultB64, nil
 }
 
 
