@@ -9,9 +9,12 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"runtime"
 	"strings"
 	"time"
 
+	"github.com/chromedp/chromedp"
 	"github.com/dop251/goja"
 	htmlpkg "golang.org/x/net/html"
 )
@@ -22,78 +25,76 @@ func patchInnerHTMLAssignment(script string) string {
 	return script
 }
 
-func (c *Client) getVQD(ctx context.Context) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL.String()+statusURL, nil)
-	if err != nil {
-		return "", fmt.Errorf("failed to create VQD request: %w", err)
+// findChromiumBrowser searches for any available Chromium-based browser
+func findChromiumBrowser() string {
+	var candidates []string
+
+	switch runtime.GOOS {
+	case "darwin": // macOS
+		candidates = []string{
+			"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+			"/Applications/Chromium.app/Contents/MacOS/Chromium",
+			"/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+			"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+			"/Applications/Opera.app/Contents/MacOS/Opera",
+		}
+	case "windows":
+		candidates = []string{
+			"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+			"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+			"C:\\Program Files\\Chromium\\Application\\chrome.exe",
+			"C:\\Program Files (x86)\\Chromium\\Application\\chrome.exe",
+			"C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+			"C:\\Program Files (x86)\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+			"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+			"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+			"C:\\Program Files\\Opera\\opera.exe",
+		}
+	case "linux":
+		candidates = []string{
+			"/usr/bin/google-chrome",
+			"/usr/bin/chromium-browser",
+			"/usr/bin/chromium",
+			"/snap/bin/chromium",
+			"/usr/bin/brave-browser",
+			"/usr/bin/microsoft-edge",
+			"/usr/bin/opera",
+		}
 	}
 
-	setCommonHeaders(req)
-	req.Header.Set("x-vqd-accept", "1")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("VQD request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("VQD request returned %d: %s", resp.StatusCode, string(body))
+	for _, path := range candidates {
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
 	}
 
-	hashHeader := resp.Header.Get("x-Vqd-hash-1")
-	if hashHeader == "" {
-		return "", fmt.Errorf("missing x-Vqd-hash-1 header in VQD response")
-	}
-
-	return c.computeVqdHash(hashHeader)
+	return ""
 }
 
-func (c *Client) computeVqdHash(scriptB64 string) (string, error) {
-	jsScript, err := base64.StdEncoding.DecodeString(scriptB64)
-	if err != nil {
-		return "", fmt.Errorf("failed to decode VQD script: %w", err)
-	}
-
-	scriptStr := string(jsScript)
-
+// computeVqdHashWithGoja fallback: execute VQD script with goja
+func computeVqdHashWithGoja(scriptStr string) (string, error) {
 	vm := goja.New()
 	setupVMStubs(vm)
 
-	// Make Promise.all return the array directly (all values are non-thenable).
-	// Combined with stripping async/await below, this avoids microtask issues.
+	// Make Promise.all return the array directly
 	vm.RunString(`Promise.all = function(arr) {
 		var result = [];
 		for(var i = 0; i < arr.length; i++) { result[i] = arr[i]; }
 		return result;
 	};`)
 
-	// Strip async/await to avoid microtask queue problems in goja.
-	// The script is: (async function(){ ... await Promise.all(...) ... })()
-	// We make it:   (function(){ ... Promise.all(...) ... })()
+	// Strip async/await
 	modified := strings.Replace(scriptStr, "(async function(){", "(function(){", 1)
 	modified = strings.Replace(modified, "await ", "", 1)
-
-	// Patch innerHTML assignment: replace el.innerHTML=X with (el.setAttribute("innerHTML",X),el.innerHTML=X)
-	// This ensures setAttribute is called for real HTML parsing.
-	// Match pattern: word.innerHTML = expr
-	// Use a more sophisticated approach: wrap the entire function to intercept innerHTML assignment.
 	modified = patchInnerHTMLAssignment(modified)
 
-	// Try to run the script with error handling
+	// Try to run the script
 	val, err := vm.RunString(modified)
-	
+
 	if err != nil {
-		// The script failed, likely due to missing DOM implementation
-		// For now, return a placeholder to allow testing other parts of the flow
-		slog.Warn("VQD script failed - returning dummy vqd hash",
-			"error", err.Error(),
-			"script_length", len(modified))
-		
-		// For testing, return a dummy VQD if script fails
-		// In production, we should keep retrying or use fallback methods
-		return "returning_dummy_for_now_unique_string_12345", nil
+		slog.Warn("VQD script failed with goja fallback",
+			"error", err.Error())
+		return "", fmt.Errorf("VQD script execution failed: %w", err)
 	}
 
 	if val == nil || goja.IsUndefined(val) || goja.IsNull(val) {
@@ -142,6 +143,185 @@ func (c *Client) computeVqdHash(scriptB64 string) (string, error) {
 		"client_hashes": hashed,
 	}
 
+	for _, k := range []string{"vqd", "dict", "server_hashes", "signals", "meta"} {
+		if v, ok := resultMap[k]; ok {
+			out[k] = v
+		}
+	}
+
+	encoded, err := json.Marshal(out)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal VQD result: %w", err)
+	}
+
+	return base64.StdEncoding.EncodeToString(encoded), nil
+}
+
+func (c *Client) getVQD(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL.String()+statusURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create VQD request: %w", err)
+	}
+
+	setCommonHeaders(req)
+	req.Header.Set("x-vqd-accept", "1")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("VQD request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("VQD request returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	hashHeader := resp.Header.Get("x-Vqd-hash-1")
+	if hashHeader == "" {
+		return "", fmt.Errorf("missing x-Vqd-hash-1 header in VQD response")
+	}
+
+	return c.computeVqdHash(hashHeader)
+}
+
+func (c *Client) computeVqdHash(scriptB64 string) (string, error) {
+	jsScript, err := base64.StdEncoding.DecodeString(scriptB64)
+	if err != nil {
+		return "", fmt.Errorf("failed to decode VQD script: %w", err)
+	}
+
+	scriptStr := string(jsScript)
+
+	// Use chromedp to execute the script in a real browser environment
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Find an available Chromium-based browser
+	browserPath := findChromiumBrowser()
+	if browserPath == "" {
+		slog.Warn("No Chromium browser found, falling back to goja")
+		return computeVqdHashWithGoja(scriptStr)
+	}
+
+	// Create chromedp allocator with the found browser
+	allocatorCtx, cancel := chromedp.NewExecAllocator(ctx,
+		chromedp.ExecPath(browserPath),
+		chromedp.NoFirstRun,
+		chromedp.NoDefaultBrowserCheck,
+		chromedp.DisableGPU,
+	)
+	defer cancel()
+
+	allocCtx, cancel := chromedp.NewContext(allocatorCtx)
+	defer cancel()
+
+	// The VQD script is an async IIFE that returns a promise
+	// We need to store the result in a global variable and wait for it to complete
+	// First, set up the window object with necessary stubs
+	setupScript := fmt.Sprintf(`
+		window.__DDG_BE_VERSION__ = 1;
+		window.__DDG_FE_CHAT_HASH__ = 1;
+		window.__vqdResult = null;
+		window.__vqdError = null;
+		(async function() {
+			try {
+				window.__vqdResult = await (%s);
+			} catch(e) {
+				window.__vqdError = e.toString();
+			}
+		})();
+	`, scriptStr)
+
+	err = chromedp.Run(allocCtx,
+		chromedp.Navigate("https://duckduckgo.com"),
+		chromedp.Evaluate(setupScript, nil),
+	)
+	if err != nil {
+		slog.Warn("VQD script setup failed via chromedp",
+			"error", err.Error(),
+			"browser_path", browserPath)
+		return computeVqdHashWithGoja(scriptStr)
+	}
+
+	// Wait for the async script to complete (up to 5 seconds)
+	time.Sleep(500 * time.Millisecond)
+
+	// Read the result
+	var result interface{}
+	var errMsg string
+	err = chromedp.Run(allocCtx,
+		chromedp.Evaluate("window.__vqdError", &errMsg),
+	)
+	if err == nil && errMsg != "" {
+		slog.Warn("VQD script execution error",
+			"error", errMsg,
+			"browser_path", browserPath)
+		return computeVqdHashWithGoja(scriptStr)
+	}
+
+	err = chromedp.Run(allocCtx,
+		chromedp.Evaluate("window.__vqdResult", &result),
+	)
+	if err != nil {
+		slog.Warn("VQD script result retrieval failed via chromedp",
+			"error", err.Error(),
+			"browser_path", browserPath)
+		return computeVqdHashWithGoja(scriptStr)
+	}
+
+	slog.Debug("VQD script execution via chromedp",
+		"result_type", fmt.Sprintf("%T", result),
+		"result_value", fmt.Sprintf("%v", result))
+
+	// Parse the result
+	resultMap, ok := result.(map[string]interface{})
+	if !ok {
+		slog.Debug("VQD result is not a map", "type", fmt.Sprintf("%T", result), "value", result)
+		return "", fmt.Errorf("VQD script returned unexpected type: %T", result)
+	}
+
+	clientHashesRaw, ok := resultMap["client_hashes"]
+	if !ok {
+		slog.Debug("VQD result keys", "keys", getKeys(resultMap))
+		return "", fmt.Errorf("VQD result missing client_hashes")
+	}
+
+	// Handle both []interface{} and []string
+	var clientHashes []string
+	switch v := clientHashesRaw.(type) {
+	case []interface{}:
+		clientHashes = make([]string, len(v))
+		for i, item := range v {
+			clientHashes[i] = fmt.Sprintf("%v", item)
+		}
+	case []string:
+		clientHashes = v
+	default:
+		slog.Debug("VQD client_hashes type", "type", fmt.Sprintf("%T", clientHashesRaw))
+		return "", fmt.Errorf("VQD client_hashes is unexpected type: %T", clientHashesRaw)
+	}
+
+	if len(clientHashes) == 0 {
+		return "", fmt.Errorf("VQD returned empty client_hashes")
+	}
+
+	// Update first hash to Chrome user agent
+	chromeUA := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+	clientHashes[0] = chromeUA
+
+	// SHA256 hash each client hash
+	hashed := make([]string, len(clientHashes))
+	for i, h := range clientHashes {
+		sum := sha256.Sum256([]byte(h))
+		hashed[i] = base64.StdEncoding.EncodeToString(sum[:])
+	}
+
+	out := map[string]interface{}{
+		"client_hashes": hashed,
+	}
+
+	// Copy other fields from result
 	for _, k := range []string{"vqd", "dict", "server_hashes", "signals", "meta"} {
 		if v, ok := resultMap[k]; ok {
 			out[k] = v
