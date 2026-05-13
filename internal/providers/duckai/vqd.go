@@ -2,6 +2,7 @@ package duckai
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -235,6 +236,7 @@ Object.freeze = function(obj) { return obj; };
 if (!window.Symbol) window.Symbol = {};
 window.HTMLDivElement = function() {};
 window.HTMLElement = function() {};
+window.Element = function() {};
 window.customElements = { define: function() {} };
 `
 
@@ -286,8 +288,13 @@ var __vqd_error = null;
 		return "", fmt.Errorf("failed to unmarshal VQD result: %w", err)
 	}
 
-	// The script already returns the correct values; don't modify them
-	// The original approach of hashing was incorrect
+	// SHA256-hash all client_hashes
+	hashedHashes := make([]string, len(scriptResult.ClientHashes))
+	for i, h := range scriptResult.ClientHashes {
+		sum := sha256.Sum256([]byte(h))
+		hashedHashes[i] = base64.StdEncoding.EncodeToString(sum[:])
+	}
+	scriptResult.ClientHashes = hashedHashes
 
 	// Serialize to JSON with ordered fields
 	encoded, err := json.Marshal(scriptResult)
