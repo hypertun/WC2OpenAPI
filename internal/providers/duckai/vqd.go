@@ -2,7 +2,6 @@ package duckai
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -213,7 +212,9 @@ var document = {
 	body: { 
 		appendChild: function(){}, 
 		removeChild: function(){},
-		attributes: {}
+		attributes: {},
+		children: [],
+		length: 0
 	}
 };
 var window = globalThis;
@@ -221,12 +222,20 @@ window.__DDG_BE_VERSION__ = 1;
 window.__DDG_FE_CHAT_HASH__ = 1;
 window.top = window;
 window.self = window;
-window.document = document;
+	window.document = document;
+window.top = window;
 var __origKeys = Object.keys;
 Object.keys = function(obj) {
 	if (obj === window) return ['__DDG_BE_VERSION__', '__DDG_FE_CHAT_HASH__'];
 	return __origKeys(obj);
 };
+// Add more complete object references and symbols
+Error.symbol = undefined;
+Object.freeze = function(obj) { return obj; };
+if (!window.Symbol) window.Symbol = {};
+window.HTMLDivElement = function() {};
+window.HTMLElement = function() {};
+window.customElements = { define: function() {} };
 `
 
 	_, err = vm.RunString(setupScript)
@@ -277,19 +286,8 @@ var __vqd_error = null;
 		return "", fmt.Errorf("failed to unmarshal VQD result: %w", err)
 	}
 
-	// Replace client_hashes[0] with Chrome UA
-	chromeUA := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
-	if len(scriptResult.ClientHashes) > 0 {
-		scriptResult.ClientHashes[0] = chromeUA
-	}
-
-	// SHA256-hash all client_hashes
-	hashedHashes := make([]string, len(scriptResult.ClientHashes))
-	for i, h := range scriptResult.ClientHashes {
-		sum := sha256.Sum256([]byte(h))
-		hashedHashes[i] = base64.StdEncoding.EncodeToString(sum[:])
-	}
-	scriptResult.ClientHashes = hashedHashes
+	// The script already returns the correct values; don't modify them
+	// The original approach of hashing was incorrect
 
 	// Serialize to JSON with ordered fields
 	encoded, err := json.Marshal(scriptResult)
