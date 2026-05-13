@@ -38,7 +38,8 @@ go build -o wc2api ./cmd/wc2api            # build binary
 - **DeepSeek Credentials**: Use env vars `DEEPSEEK_EMAIL` + `DEEPSEEK_PASSWORD` (not config file).
 - **Qwen Credentials**: Use env vars `QWEN_EMAIL` + `QWEN_PASSWORD` (not config file).
 - **Timeouts**: All values in `config.json` are **integers (seconds)**, not Go duration strings.
-- **API keys**: Set `auth.api_keys` in config. If empty, auth middleware is bypassed (dev mode).
+- **API keys**: Set `auth.api_keys` to enforce API key auth; empty list = bypass (dev mode).
+- **G365 Browser**: Set `provider.g365.browser_executable_path` to point to a Chromium-based browser (Chrome, Edge, Brave, etc.). Leave empty to auto-detect.
 - `.gitignore` includes `config.json` and `.env`.
 
 ## API Endpoints
@@ -59,24 +60,36 @@ go build -o wc2api ./cmd/wc2api            # build binary
 - `qwen3.6-plus` — Enhanced model with more capabilities (model_type: expert)
 - `qwen3.5-flash-nothinking` / `qwen3.6-plus-nothinking` — Disable thinking/reasoning (suffix stripped before sending)
 
+### Microsoft 365 Copilot (G365)
+- `gpt-5.5-quick` — Fast chat model (tone: `Gpt_5_5_Chat`)
+- `gpt-5.5-think-deeper` — Reasoning model with deeper thinking (tone: `Gpt_5_5_Reasoning`)
+- `gpt-5.5-quick-nothinking` / `gpt-5.5-think-deeper-nothinking` — Disable thinking/reasoning variants
+
 ## Provider Support
 
-Both DeepSeek and Qwen providers can be enabled:
-- **Model routing**: Requests route based on model name prefix (`deepseek-*` → DeepSeek, `qwen-*` → Qwen)
+All three providers can be enabled simultaneously:
+- **Model routing**: Requests route based on model name prefix (`deepseek-*` → DeepSeek, `qwen-*` → Qwen, `gpt-5.5-*` → G365)
 - **Fallback**: Unrecognized model names use the first available provider
 
 ## Tool Calling
 
-Implemented via tool schema injection in system prompt + parsing of response text:
+All three providers support function calling with different formats:
 
 **DeepSeek:**
-- DSML markup (`` / `<invoke>`) parsing
+- DSML markup (`<|DSML|tool_calls><|DSML|invoke name="...">`) parsing
 - Tool schemas injected into system message as DSML instructions
+- Buffers full response before extracting tool calls
 
 **Qwen:**
 - `##TOOL_CALL##` / `##END_CALL##` marker parsing
-- Native function calling disabled (`function_calling: false, enable_tools: false`) to prevent upstream interception
+- Native function calling disabled to prevent upstream interception
 - Supports `phase` field in streaming: "answer" (text), "think" (reasoning), "tool_call" (structured calls)
+- Buffers full response before extracting tool calls
+
+**G365 (Microsoft 365 Copilot):**
+- DSML markup (`<|DSML|tool_calls><|DSML|invoke name="...">`) parsing from browser-rendered text
+- Tool schemas injected into user message as DSML instructions (M365 respects instructions in user context)
+- Streams tool call events as they appear; no full-response buffering
 
 ## Streaming Quirk
 
@@ -109,6 +122,12 @@ internal/
   providers/               # Provider interface + shared types
     deepseek/              # DeepSeek webchat implementation (DS2API-style)
     qwen/                  # Qwen webchat implementation (API-based auth)
+    g365/                  # Microsoft 365 Copilot (browser automation via chromedp)
+      browser.go           # Chromium context management, bridge injection
+      bridge.go            # JS injected into M365 page (WebSocket interception, DSML extraction)
+      client.go            # Provider client, WebSocket relay management
+      server.go            # Internal WS server, tool message routing
+      models.go            # G365 model definitions
   config/                  # JSON + env config loader
   toolcall/                # DSML/##TOOL_CALL## tool call parsing + prompt injection
 configs/                   # Config templates (example only)

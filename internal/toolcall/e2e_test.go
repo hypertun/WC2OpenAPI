@@ -102,7 +102,7 @@ func TestE2E_NoToolsNoValidation(t *testing.T) {
 	}
 
 	errors := ValidateToolCallsWithErrors(calls, nil)
-	if errors != nil && len(errors) > 0 {
+	if len(errors) > 0 {
 		t.Errorf("expected no validation errors when no tools provided, got %d", len(errors))
 	}
 }

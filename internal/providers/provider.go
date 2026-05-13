@@ -46,10 +46,11 @@ func (m *MessageContent) UnmarshalJSON(data []byte) error {
 
 // Message represents a chat message
 type Message struct {
-	Role       string     `json:"role"`
-	Content    MessageContent `json:"content"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"` // For role="tool" messages
+	Role             string         `json:"role"`
+	Content          MessageContent `json:"content"`
+	ToolCalls        []ToolCall     `json:"tool_calls,omitempty"`
+	ToolCallID       string         `json:"tool_call_id,omitempty"` // For role="tool" messages
+	ReasoningContent string         `json:"reasoning_content,omitempty"`
 }
 
 // Tool represents a function tool
@@ -181,9 +182,10 @@ type StreamChoice struct {
 
 // Delta represents a streaming delta
 type Delta struct {
-	Role    string     `json:"role,omitempty"`
-	Content string     `json:"content,omitempty"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	Role             string     `json:"role,omitempty"`
+	Content          string     `json:"content,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
 }
 
 // Model represents an available model

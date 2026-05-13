@@ -127,12 +127,16 @@ data: [DONE]
 	}
 
 	content := ""
+	reasoning := ""
 	for _, c := range chunks[:len(chunks)-1] {
 		content += c.Choices[0].Delta.Content
+		reasoning += c.Choices[0].Delta.ReasoningContent
 	}
-	expected := "Thinking... answer"
-	if content != expected {
-		t.Errorf("expected content %q, got %q", expected, content)
+	if content != " answer" {
+		t.Errorf("expected content ' answer', got %q", content)
+	}
+	if reasoning != "Thinking..." {
+		t.Errorf("expected reasoning 'Thinking...', got %q", reasoning)
 	}
 }
 

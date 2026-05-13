@@ -21,6 +21,7 @@ vendor/
 *.swp
 *.swo
 *~
+.profile/
 
 # OS files
 .DS_Store
@@ -33,6 +34,9 @@ config.json
 # Temporary files
 *.tmp
 *.log
+
+# Node.js (used for VQD decoding)
+node_modules/
 
 # Build artifacts
 dist/

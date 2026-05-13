@@ -78,7 +78,7 @@ func (c *Client) chatWithRetry(ctx context.Context, req *providers.ChatRequest, 
 	slog.Debug("Qwen completion response", "body_preview", string(body)[:min(len(body), 500)])
 
 	// Parse SSE content
-	content, toolCalls := parseSSEContent(string(body), req.Tools)
+	content, reasoningContent, toolCalls := parseSSEContent(string(body), req.Tools)
 
 	// Retry on invalid tool calls
 	validationErrors := validateToolCallsWithErrors(toolCalls, req.Tools)
@@ -148,15 +148,17 @@ func (c *Client) chatWithRetry(ctx context.Context, req *providers.ChatRequest, 
 		chatResp.Choices[0].FinishReason = "tool_calls"
 	} else {
 		chatResp.Choices[0].Message.Content = providers.MessageContent(content)
+		chatResp.Choices[0].Message.ReasoningContent = reasoningContent
 	}
 
 	return chatResp, nil
 }
 
 // parseSSEContent extracts content from SSE response
-func parseSSEContent(sseBody string, tools []providers.Tool) (string, []providers.ToolCall) {
+// Returns content, reasoningContent, and optionally tool calls
+func parseSSEContent(sseBody string, tools []providers.Tool) (string, string, []providers.ToolCall) {
 	lines := strings.Split(sseBody, "\n")
-	var content strings.Builder
+	var content, reasoning strings.Builder
 	var allToolCalls []providers.ToolCall
 
 	for _, line := range lines {
@@ -197,8 +199,7 @@ func parseSSEContent(sseBody string, tools []providers.Tool) (string, []provider
 		// Handle different phases
 		switch phase {
 		case "think", "thinking_summary":
-			// Reasoning content - append to content
-			content.WriteString(contentStr)
+			reasoning.WriteString(contentStr)
 		case "tool_call":
 			// Native tool call - buffer as regular content; tool calls detected via marker parsing on fullText
 			content.WriteString(contentStr)
@@ -209,7 +210,7 @@ func parseSSEContent(sseBody string, tools []providers.Tool) (string, []provider
 		}
 	}
 
-	fullText := strings.TrimSpace(content.String())
+	fullText := strings.TrimSpace(content.String() + reasoning.String())
 
 	// Check for ##TOOL_CALL## markers in the full text
 	toolCalls, err := parseToolCallsFromText(fullText, tools)
@@ -226,10 +227,10 @@ func parseSSEContent(sseBody string, tools []providers.Tool) (string, []provider
 			"count", len(toolCalls),
 			"tools", toolNames,
 		)
-		return "", toolCalls
+		return "", "", toolCalls
 	}
 
-	return fullText, allToolCalls
+	return strings.TrimSpace(content.String()), strings.TrimSpace(reasoning.String()), allToolCalls
 }
 
 // CreateChatCompletionStream creates a streaming chat completion with Qwen
@@ -387,7 +388,7 @@ func (c *Client) streamWithRetry(ctx context.Context, req *providers.ChatRequest
 						Choices: []providers.StreamChoice{
 							{
 								Index: 0,
-								Delta: providers.Delta{Content: contentStr},
+								Delta: providers.Delta{ReasoningContent: contentStr},
 							},
 						},
 					}

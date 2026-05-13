@@ -51,8 +51,3 @@ func injectToolPrompt(messages []providers.Message, tools []providers.Tool, tool
 
 	return result
 }
-
-// buildToolCallInstructions creates the DSML tool call format instructions
-func buildToolCallInstructions(tools []providers.Tool) string {
-	return toolcall.BuildToolCallInstructions(tools)
-}

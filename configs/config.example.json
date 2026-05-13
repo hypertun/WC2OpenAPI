@@ -23,6 +23,11 @@
       "base_url": "https://chat.qwen.ai",
       "timeout": 120,
       "token_refresh_interval": 1800
+    },
+    "duckai": {
+      "enabled": false,
+      "base_url": "https://duckduckgo.com",
+      "timeout": 60
     }
   }
 }

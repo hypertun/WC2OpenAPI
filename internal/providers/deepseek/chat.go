@@ -132,7 +132,7 @@ func (c *Client) chatWithRetry(ctx context.Context, req *providers.ChatRequest, 
 		chatResp.Choices[0].Message.ToolCalls = toolCalls
 		chatResp.Choices[0].FinishReason = "tool_calls"
 	} else {
-			chatResp.Choices[0].Message.Content = providers.MessageContent(content)
+		chatResp.Choices[0].Message.Content = providers.MessageContent(content)
 	}
 
 	return chatResp, nil
@@ -224,13 +224,6 @@ func getReqID(ctx context.Context) string {
 		return reqID
 	}
 	return "unknown"
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 func stringPtr(s string) *string {
@@ -436,8 +429,15 @@ func (c *Client) convertRequest(req *providers.ChatRequest) *deepseekRequest {
 	// Remove -nothinking suffix from model name (handled separately)
 	model = strings.TrimSuffix(model, "_nothinking")
 
-	// Get model type based on model name
-	modelType := getModelType(req.Model)
+	// Look up model_type from the public name map
+	baseModel := strings.TrimSuffix(req.Model, "-nothinking")
+	modelType := "default"
+	for mt, publicName := range modelTypeToPublicName {
+		if publicName == baseModel {
+			modelType = mt
+			break
+		}
+	}
 
 	// Inject tool prompt if tools are present
 	messages := req.Messages
@@ -478,8 +478,8 @@ func (c *Client) formatMessagesToPrompt(messages []providers.Message) string {
 				for _, tc := range msg.ToolCalls {
 					toolCallParts = append(toolCallParts, fmt.Sprintf(
 						`<|DSML|invoke name="%s">`+
-						`<|DSML|parameter name="arguments"><![CDATA[%s]]></|DSML|parameter>`+
-						`</|DSML|invoke>`,
+							`<|DSML|parameter name="arguments"><![CDATA[%s]]></|DSML|parameter>`+
+							`</|DSML|invoke>`,
 						tc.Function.Name,
 						tc.Function.Arguments,
 					))

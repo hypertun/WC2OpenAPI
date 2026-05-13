@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/user/wc2api/internal/handlers"
 	"github.com/user/wc2api/internal/providers"
 	"github.com/user/wc2api/internal/providers/deepseek"
+	"github.com/user/wc2api/internal/providers/duckai"
 	"github.com/user/wc2api/internal/providers/qwen"
 	serverMiddleware "github.com/user/wc2api/internal/server/middleware"
 )
@@ -41,6 +43,7 @@ func New(cfg *config.Config) (*Server, error) {
 	if cfg.Provider.DeepSeek.Enabled {
 		prov, err := deepseek.New(cfg.Provider.DeepSeek)
 		if err != nil {
+			slog.Error("failed to create deepseek provider", "error", err)
 			errors = append(errors, fmt.Errorf("failed to create deepseek provider: %w", err))
 		} else {
 			s.providers = append(s.providers, prov)
@@ -50,7 +53,18 @@ func New(cfg *config.Config) (*Server, error) {
 	if cfg.Provider.Qwen.Enabled {
 		prov, err := qwen.New(cfg.Provider.Qwen)
 		if err != nil {
+			slog.Error("failed to create qwen provider", "error", err)
 			errors = append(errors, fmt.Errorf("failed to create qwen provider: %w", err))
+		} else {
+			s.providers = append(s.providers, prov)
+		}
+	}
+
+	if cfg.Provider.DuckAI.Enabled {
+		prov, err := duckai.New(cfg.Provider.DuckAI)
+		if err != nil {
+			slog.Error("failed to create duckai provider", "error", err)
+			errors = append(errors, fmt.Errorf("failed to create duckai provider: %w", err))
 		} else {
 			s.providers = append(s.providers, prov)
 		}
@@ -90,7 +104,7 @@ func (s *Server) createRouter() func(model string) (providers.Provider, bool) {
 
 	return func(model string) (providers.Provider, bool) {
 		model = strings.ToLower(model)
-		
+
 		// Check prefixes
 		for prefix, prov := range prefixToProvider {
 			if strings.HasPrefix(model, prefix+"-") || model == prefix {
@@ -167,4 +181,11 @@ func (s *Server) Stop() {
 	defer cancel()
 
 	s.httpServer.Shutdown(ctx)
+
+	// Close all providers (e.g., browsers)
+	for _, p := range s.providers {
+		if err := p.Close(); err != nil {
+			slog.Error("provider close error", "provider", p.Name(), "error", err)
+		}
+	}
 }

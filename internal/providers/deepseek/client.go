@@ -21,7 +21,15 @@ const (
 	deviceID = "deepseek_to_api"
 	osType   = "android"
 	completionURL = "/api/v0/chat/completion"
+	settingsURL   = "/api/v0/client/settings"
 )
+
+// modelTypeToPublicName maps DeepSeek's internal model_type to OpenAI-compatible model names.
+// This is the single source of truth for model name lookup.
+var modelTypeToPublicName = map[string]string{
+	"default": "deepseek-v4-flash",
+	"expert":  "deepseek-v4-pro",
+}
 
 // Client handles DeepSeek webchat interactions with DS2API-style auth
 type Client struct {
@@ -194,30 +202,6 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 	return c.httpClient.Do(req)
 }
 
-// doRequestWithRetry wraps doRequest with auth-failure detection and retry
-func (c *Client) doRequestWithRetry(ctx context.Context, method, path string, body interface{}) (*http.Response, error) {
-	resp, err := c.doRequest(ctx, method, path, body)
-	if err != nil {
-		return nil, err
-	}
-
-	if isAuthFailure(resp) {
-		slog.Warn("Auth failure detected, attempting re-login")
-		resp.Body.Close()
-
-		if reLoginErr := c.login(); reLoginErr != nil {
-			return nil, reLoginErr
-		}
-		if c.sessionID != "" {
-			c.createSession()
-		}
-
-		return c.doRequest(ctx, method, path, body)
-	}
-
-	return resp, nil
-}
-
 // doRequestWithRetryAndPow wraps doRequest with auth-failure detection, retry, and PoW header
 func (c *Client) doRequestWithRetryAndPow(ctx context.Context, method, path string, body interface{}, powHeader string) (*http.Response, error) {
 	resp, err := c.doRequestWithPow(ctx, method, path, body, powHeader)
@@ -293,23 +277,85 @@ func (c *Client) ensureAuthenticated() error {
 	return nil
 }
 
-// ListModels returns available DeepSeek models
+// ListModels returns available DeepSeek models fetched from the settings API.
+// Falls back to hardcoded defaults if the API call fails.
 func (c *Client) ListModels() []providers.Model {
-	baseModels := []providers.Model{
-		{
-			ID:      "deepseek-v4-flash",
-			Object:  "model",
-			Created: 1677610602,
-			OwnedBy: "deepseek",
-		},
-		{
-			ID:      "deepseek-v4-pro",
-			Object:  "model",
-			Created: 1677610602,
-			OwnedBy: "deepseek",
-		},
+	models, err := c.fetchModelsFromAPI()
+	if err != nil {
+		slog.Warn("Failed to fetch models from API, using fallback", "error", err)
+		return fallbackModels()
 	}
-	return appendNoThinkingVariants(baseModels)
+	return models
+}
+
+// fetchModelsFromAPI calls the settings endpoint to get available model types
+func (c *Client) fetchModelsFromAPI() ([]providers.Model, error) {
+	dctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := c.doRequest(dctx, "GET", settingsURL+"?scope=model", nil)
+	if err != nil {
+		return nil, fmt.Errorf("settings request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("settings request returned status %d", resp.StatusCode)
+	}
+
+	var result struct {
+		Code int                    `json:"code"`
+		Data map[string]interface{} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to parse settings response: %w", err)
+	}
+	if result.Code != 0 {
+		return nil, fmt.Errorf("settings API returned error code: %d", result.Code)
+	}
+
+	bizData, _ := result.Data["biz_data"].(map[string]interface{})
+	settings, _ := bizData["settings"].(map[string]interface{})
+	modelConfigs, _ := settings["model_configs"].(map[string]interface{})
+	values, _ := modelConfigs["value"].([]interface{})
+
+	var models []providers.Model
+	for _, v := range values {
+		cfg, _ := v.(map[string]interface{})
+		modelType, _ := cfg["model_type"].(string)
+		enabled, _ := cfg["enabled"].(bool)
+
+		if !enabled {
+			continue
+		}
+
+		publicName, ok := modelTypeToPublicName[modelType]
+		if !ok {
+			continue
+		}
+
+		models = append(models, providers.Model{
+			ID:      publicName,
+			Object:  "model",
+			Created: time.Now().Unix(),
+			OwnedBy: "deepseek",
+		})
+	}
+
+	if len(models) == 0 {
+		return nil, fmt.Errorf("no enabled models found in settings")
+	}
+
+	return appendNoThinkingVariants(models), nil
+}
+
+// fallbackModels returns the hardcoded model list used when the API is unreachable
+func fallbackModels() []providers.Model {
+	base := []providers.Model{
+		{ID: "deepseek-v4-flash", Object: "model", Created: 1677610602, OwnedBy: "deepseek"},
+		{ID: "deepseek-v4-pro", Object: "model", Created: 1677610602, OwnedBy: "deepseek"},
+	}
+	return appendNoThinkingVariants(base)
 }
 
 // appendNoThinkingVariants adds -nothinking variants for each model
@@ -325,21 +371,6 @@ func appendNoThinkingVariants(models []providers.Model) []providers.Model {
 		}
 	}
 	return result
-}
-
-// getModelType returns the DeepSeek model_type for a given model ID
-// flash models → "default", pro models → "expert"
-func getModelType(model string) string {
-	// Strip -nothinking suffix if present
-	base := strings.TrimSuffix(model, "-nothinking")
-	switch base {
-	case "deepseek-v4-pro":
-		return "expert"
-	case "deepseek-v4-flash":
-		return "default"
-	default:
-		return "default"
-	}
 }
 
 // Close cleans up the client
