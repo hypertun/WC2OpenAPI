@@ -72,6 +72,12 @@ func getKeys(m map[string]interface{}) []string {
 	return keys
 }
 
+// jsonStringify converts a string to a JSON-quoted string for safe JavaScript embedding
+func jsonStringify(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
 func (c *Client) getVQD(ctx context.Context) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL.String()+statusURL, nil)
 	if err != nil {
@@ -124,20 +130,63 @@ func (c *Client) computeVqdHash(scriptB64 string) (string, error) {
 		chromedp.NoFirstRun,
 		chromedp.NoDefaultBrowserCheck,
 		chromedp.DisableGPU,
+		chromedp.Flag("headless", "new"),
 	)
 	defer cancel()
 
 	allocCtx, cancel := chromedp.NewContext(allocatorCtx)
 	defer cancel()
 
-	// The VQD script is an async IIFE that returns a promise
-	// We need to store the result in a global variable and wait for it to complete
-	// First, set up the window object with necessary stubs
-	setupScript := fmt.Sprintf(`
+	// Navigate to about:blank first
+	err = chromedp.Run(allocCtx,
+		chromedp.Navigate("about:blank"),
+	)
+	if err != nil {
+		slog.Warn("VQD script navigation failed via chromedp",
+			"error", err.Error(),
+			"browser_path", browserPath)
+		return "", fmt.Errorf("VQD script navigation failed: %w", err)
+	}
+
+	// Inject the HTML with the iframe and set up globals and result containers
+	// We create the iframe with sandbox attribute and srcdoc containing minimal HTML
+	iframeHTML := `<!DOCTYPE html><html><head><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'"></head><body></body></html>`
+	
+	injectHTMLScript := fmt.Sprintf(`
+		// Create iframe element
+		const iframe = document.createElement('iframe');
+		iframe.id = 'jsa';
+		iframe.sandbox.add('allow-scripts');
+		iframe.sandbox.add('allow-same-origin');
+		iframe.style.position = 'absolute';
+		iframe.style.left = '-9999px';
+		iframe.style.top = '-9999px';
+		// Set srcdoc to minimal HTML with CSP meta tag
+		iframe.srcdoc = %s;
+		document.body.appendChild(iframe);
+		
+		// Set up window globals
 		window.__DDG_BE_VERSION__ = 1;
 		window.__DDG_FE_CHAT_HASH__ = 1;
 		window.__vqdResult = null;
 		window.__vqdError = null;
+	`, jsonStringify(iframeHTML))
+
+	err = chromedp.Run(allocCtx,
+		chromedp.Evaluate(injectHTMLScript, nil),
+	)
+	if err != nil {
+		slog.Warn("VQD HTML injection failed via chromedp",
+			"error", err.Error(),
+			"browser_path", browserPath)
+		return "", fmt.Errorf("VQD HTML injection failed: %w", err)
+	}
+
+	// Give the DOM a moment to settle for iframe srcdoc to be processed
+	time.Sleep(200 * time.Millisecond)
+
+	// Now inject and run the DDG script
+	runVQDScript := fmt.Sprintf(`
 		(async function() {
 			try {
 				window.__vqdResult = await (%s);
@@ -148,107 +197,119 @@ func (c *Client) computeVqdHash(scriptB64 string) (string, error) {
 	`, scriptStr)
 
 	err = chromedp.Run(allocCtx,
-		chromedp.Navigate("https://duckduckgo.com"),
-		chromedp.Evaluate(setupScript, nil),
+		chromedp.Evaluate(runVQDScript, nil),
 	)
 	if err != nil {
-		slog.Warn("VQD script setup failed via chromedp",
+		slog.Warn("VQD script execution failed via chromedp",
 			"error", err.Error(),
 			"browser_path", browserPath)
-		return "", fmt.Errorf("VQD script setup failed: %w", err)
+		return "", fmt.Errorf("VQD script execution failed: %w", err)
 	}
 
-	// Wait for the async script to complete (up to 5 seconds)
-	time.Sleep(500 * time.Millisecond)
+	// Poll for the async script result (up to 5 seconds)
+	maxWaitTime := 5 * time.Second
+	pollInterval := 100 * time.Millisecond
+	startTime := time.Now()
 
-	// Read the result
-	var result interface{}
-	var errMsg string
-	err = chromedp.Run(allocCtx,
-		chromedp.Evaluate("window.__vqdError", &errMsg),
-	)
-	if err == nil && errMsg != "" {
-		slog.Warn("VQD script execution error",
-			"error", errMsg,
-			"browser_path", browserPath)
-		return "", fmt.Errorf("VQD script execution error: %s", errMsg)
-	}
+	for time.Since(startTime) < maxWaitTime {
+		var result interface{}
+		var errMsg string
 
-	err = chromedp.Run(allocCtx,
-		chromedp.Evaluate("window.__vqdResult", &result),
-	)
-	if err != nil {
-		slog.Warn("VQD script result retrieval failed via chromedp",
-			"error", err.Error(),
-			"browser_path", browserPath)
-		return "", fmt.Errorf("VQD script result retrieval failed: %w", err)
-	}
-
-	slog.Debug("VQD script execution via chromedp",
-		"result_type", fmt.Sprintf("%T", result),
-		"result_value", fmt.Sprintf("%v", result))
-
-	// Parse the result
-	resultMap, ok := result.(map[string]interface{})
-	if !ok {
-		slog.Debug("VQD result is not a map", "type", fmt.Sprintf("%T", result), "value", result)
-		return "", fmt.Errorf("VQD script returned unexpected type: %T", result)
-	}
-
-	clientHashesRaw, ok := resultMap["client_hashes"]
-	if !ok {
-		slog.Debug("VQD result keys", "keys", getKeys(resultMap))
-		return "", fmt.Errorf("VQD result missing client_hashes")
-	}
-
-	// Handle both []interface{} and []string
-	var clientHashes []string
-	switch v := clientHashesRaw.(type) {
-	case []interface{}:
-		clientHashes = make([]string, len(v))
-		for i, item := range v {
-			clientHashes[i] = fmt.Sprintf("%v", item)
+		// Check for error first
+		errErr := chromedp.Run(allocCtx,
+			chromedp.Evaluate("window.__vqdError", &errMsg),
+		)
+		if errErr != nil {
+			slog.Debug("Error checking window.__vqdError",
+				"error", errErr.Error())
+		} else if errMsg != "" {
+			slog.Warn("VQD script execution error",
+				"error", errMsg,
+				"browser_path", browserPath)
+			return "", fmt.Errorf("VQD script execution error: %s", errMsg)
 		}
-	case []string:
-		clientHashes = v
-	default:
-		slog.Debug("VQD client_hashes type", "type", fmt.Sprintf("%T", clientHashesRaw))
-		return "", fmt.Errorf("VQD client_hashes is unexpected type: %T", clientHashesRaw)
-	}
 
-	if len(clientHashes) == 0 {
-		return "", fmt.Errorf("VQD returned empty client_hashes")
-	}
+		// Check for result
+		resErr := chromedp.Run(allocCtx,
+			chromedp.Evaluate("window.__vqdResult", &result),
+		)
+		if resErr == nil && result != nil {
+			// Result is ready, parse it
+			slog.Debug("VQD script result retrieved",
+				"result_type", fmt.Sprintf("%T", result),
+				"result_value", fmt.Sprintf("%v", result))
 
-	// Update first hash to Chrome user agent
-	chromeUA := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
-	clientHashes[0] = chromeUA
+			resultMap, ok := result.(map[string]interface{})
+			if !ok {
+				slog.Debug("VQD result is not a map", "type", fmt.Sprintf("%T", result), "value", result)
+				return "", fmt.Errorf("VQD script returned unexpected type: %T", result)
+			}
 
-	// SHA256 hash each client hash
-	hashed := make([]string, len(clientHashes))
-	for i, h := range clientHashes {
-		sum := sha256.Sum256([]byte(h))
-		hashed[i] = base64.StdEncoding.EncodeToString(sum[:])
-	}
+			clientHashesRaw, ok := resultMap["client_hashes"]
+			if !ok {
+				slog.Debug("VQD result keys", "keys", getKeys(resultMap))
+				return "", fmt.Errorf("VQD result missing client_hashes")
+			}
 
-	out := map[string]interface{}{
-		"client_hashes": hashed,
-	}
+			// Handle both []interface{} and []string
+			var clientHashes []string
+			switch v := clientHashesRaw.(type) {
+			case []interface{}:
+				clientHashes = make([]string, len(v))
+				for i, item := range v {
+					clientHashes[i] = fmt.Sprintf("%v", item)
+				}
+			case []string:
+				clientHashes = v
+			default:
+				slog.Debug("VQD client_hashes type", "type", fmt.Sprintf("%T", clientHashesRaw))
+				return "", fmt.Errorf("VQD client_hashes is unexpected type: %T", clientHashesRaw)
+			}
 
-	// Copy other fields from result
-	for _, k := range []string{"vqd", "dict", "server_hashes", "signals", "meta"} {
-		if v, ok := resultMap[k]; ok {
-			out[k] = v
+			if len(clientHashes) == 0 {
+				return "", fmt.Errorf("VQD returned empty client_hashes")
+			}
+
+			// Update first hash to Chrome user agent
+			chromeUA := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+			clientHashes[0] = chromeUA
+
+			// SHA256 hash each client hash
+			hashed := make([]string, len(clientHashes))
+			for i, h := range clientHashes {
+				sum := sha256.Sum256([]byte(h))
+				hashed[i] = base64.StdEncoding.EncodeToString(sum[:])
+			}
+
+			out := map[string]interface{}{
+				"client_hashes": hashed,
+			}
+
+			// Copy other fields from result
+			for _, k := range []string{"vqd", "dict", "server_hashes", "signals", "meta"} {
+				if v, ok := resultMap[k]; ok {
+					out[k] = v
+				}
+			}
+
+			encoded, err := json.Marshal(out)
+			if err != nil {
+				return "", fmt.Errorf("failed to marshal VQD result: %w", err)
+			}
+
+			return base64.StdEncoding.EncodeToString(encoded), nil
 		}
+
+		// Not ready yet, wait and retry
+		time.Sleep(pollInterval)
 	}
 
-	encoded, err := json.Marshal(out)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal VQD result: %w", err)
-	}
-
-	return base64.StdEncoding.EncodeToString(encoded), nil
+	// Timeout waiting for result
+	slog.Warn("VQD script result retrieval timed out via chromedp",
+		"browser_path", browserPath)
+	return "", fmt.Errorf("VQD script result retrieval timed out after %v", maxWaitTime)
 }
+
 
 func setCommonHeaders(req *http.Request) {
 	ua := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
