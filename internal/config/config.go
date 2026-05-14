@@ -30,8 +30,7 @@ type AuthConfig struct {
 // ProviderConfig holds provider-specific settings
 type ProviderConfig struct {
 	DeepSeek DeepSeekConfig `json:"deepseek"`
-	Qwen     QwenConfig     `json:"qwen"`
-	DuckAI   DuckAIConfig   `json:"duckai"`
+Qwen     QwenConfig     `json:"qwen"`
 }
 
 // DeepSeekConfig holds DeepSeek provider settings
@@ -58,14 +57,6 @@ type QwenConfig struct {
 	TokenRefreshInterval int    `json:"token_refresh_interval"` // seconds
 }
 
-// DuckAIConfig holds DuckDuckGo AI provider settings
-// No email/password needed — free access via VQD tokens
-type DuckAIConfig struct {
-	Enabled bool   `json:"enabled"`
-	BaseURL string `json:"base_url"`
-	Timeout int    `json:"timeout"` // seconds
-}
-
 // DefaultConfig returns a configuration with sensible defaults
 func DefaultConfig() *Config {
 	return &Config{
@@ -87,18 +78,12 @@ func DefaultConfig() *Config {
 				Timeout:              120,  // seconds per AGENTS.md
 				TokenRefreshInterval: 1800, // 30 minutes in seconds
 			},
-		Qwen: QwenConfig{
-			Enabled:              false,
-			BaseURL:              "https://chat.qwen.ai",
-			Timeout:              120,  // seconds per AGENTS.md
-			TokenRefreshInterval: 1800, // 30 minutes in seconds
-		},
-		DuckAI: DuckAIConfig{
-			Enabled: false,
-			BaseURL: "https://duckduckgo.com",
-			Timeout: 60, // seconds
-		},
-
+			Qwen: QwenConfig{
+				Enabled:              false,
+				BaseURL:              "https://chat.qwen.ai",
+				Timeout:              120,  // seconds per AGENTS.md
+				TokenRefreshInterval: 1800, // 30 minutes in seconds
+			},
 		},
 	}
 }

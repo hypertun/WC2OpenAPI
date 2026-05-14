@@ -15,7 +15,6 @@ import (
 	"github.com/user/wc2api/internal/handlers"
 	"github.com/user/wc2api/internal/providers"
 	"github.com/user/wc2api/internal/providers/deepseek"
-	"github.com/user/wc2api/internal/providers/duckai"
 	"github.com/user/wc2api/internal/providers/qwen"
 	serverMiddleware "github.com/user/wc2api/internal/server/middleware"
 )
@@ -55,16 +54,6 @@ func New(cfg *config.Config) (*Server, error) {
 		if err != nil {
 			slog.Error("failed to create qwen provider", "error", err)
 			errors = append(errors, fmt.Errorf("failed to create qwen provider: %w", err))
-		} else {
-			s.providers = append(s.providers, prov)
-		}
-	}
-
-	if cfg.Provider.DuckAI.Enabled {
-		prov, err := duckai.New(cfg.Provider.DuckAI)
-		if err != nil {
-			slog.Error("failed to create duckai provider", "error", err)
-			errors = append(errors, fmt.Errorf("failed to create duckai provider: %w", err))
 		} else {
 			s.providers = append(s.providers, prov)
 		}
