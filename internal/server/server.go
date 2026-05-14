@@ -14,7 +14,6 @@ import (
 	"github.com/user/wc2api/internal/config"
 	"github.com/user/wc2api/internal/handlers"
 	"github.com/user/wc2api/internal/providers"
-	"github.com/user/wc2api/internal/providers/deepseek"
 	"github.com/user/wc2api/internal/providers/qwen"
 	serverMiddleware "github.com/user/wc2api/internal/server/middleware"
 )
@@ -38,16 +37,6 @@ func New(cfg *config.Config) (*Server, error) {
 
 	// Initialize providers
 	errors := []error{}
-
-	if cfg.Provider.DeepSeek.Enabled {
-		prov, err := deepseek.New(cfg.Provider.DeepSeek)
-		if err != nil {
-			slog.Error("failed to create deepseek provider", "error", err)
-			errors = append(errors, fmt.Errorf("failed to create deepseek provider: %w", err))
-		} else {
-			s.providers = append(s.providers, prov)
-		}
-	}
 
 	if cfg.Provider.Qwen.Enabled {
 		prov, err := qwen.New(cfg.Provider.Qwen)

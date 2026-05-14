@@ -267,10 +267,12 @@ func parseToolCallMarkers(text string) []providers.ToolCall {
 			continue
 		}
 
-		// Apply tool argument fixes
-		toolData.Input = fixToolCallArguments(toolData.Name, toolData.Input)
+		// De-obfuscate the tool name first, then apply fixes with the real name
+		// This ensures tool-specific parameter fixes use the correct tool name
+		deName := fromQwenName(toolData.Name)
+		toolData.Input = fixToolCallArguments(deName, toolData.Input)
 
-		slog.Debug("Parsed tool call", "name", toolData.Name, "args", toolData.Input)
+		slog.Debug("Parsed tool call", "name", deName, "args", toolData.Input)
 
 		argsJSON, err := json.Marshal(toolData.Input)
 		if err != nil {
@@ -282,7 +284,7 @@ func parseToolCallMarkers(text string) []providers.ToolCall {
 			ID:   fmt.Sprintf("call_%d", i),
 			Type: "function",
 			Function: providers.ToolCallFunction{
-				Name:      fromQwenName(toolData.Name),
+				Name:      deName,
 				Arguments: string(argsJSON),
 			},
 		})
@@ -314,14 +316,16 @@ func parseToolCallFallback(text string) []providers.ToolCall {
 			continue
 		}
 
-		toolData.Input = fixToolCallArguments(toolData.Name, toolData.Input)
+		// De-obfuscate the tool name first
+		deName := fromQwenName(toolData.Name)
+		toolData.Input = fixToolCallArguments(deName, toolData.Input)
 
 		argsJSON, _ := json.Marshal(toolData.Input)
 		calls = append(calls, providers.ToolCall{
 			ID:   fmt.Sprintf("call_%d", i),
 			Type: "function",
 			Function: providers.ToolCallFunction{
-				Name:      fromQwenName(toolData.Name),
+				Name:      deName,
 				Arguments: string(argsJSON),
 			},
 		})
@@ -361,13 +365,15 @@ func parseToolCallFallback(text string) []providers.ToolCall {
 					}
 				}
 
-				input = fixToolCallArguments(name, input)
+				// De-obfuscate the tool name first
+				deName := fromQwenName(name)
+				input = fixToolCallArguments(deName, input)
 				argsJSON, _ := json.Marshal(input)
 				calls = append(calls, providers.ToolCall{
 					ID:   fmt.Sprintf("call_%d", i),
 					Type: "function",
 					Function: providers.ToolCallFunction{
-						Name:      fromQwenName(name),
+						Name:      deName,
 						Arguments: string(argsJSON),
 					},
 				})
@@ -402,13 +408,15 @@ func parseNativeToolCalls(text string) []providers.ToolCall {
 		}
 
 		if toolData.Type == "tool_use" && toolData.Name != "" {
-			toolData.Input = fixToolCallArguments(toolData.Name, toolData.Input)
+			// De-obfuscate the tool name first
+			deName := fromQwenName(toolData.Name)
+			toolData.Input = fixToolCallArguments(deName, toolData.Input)
 			argsJSON, _ := json.Marshal(toolData.Input)
 			calls = append(calls, providers.ToolCall{
 				ID:   toolData.ID,
 				Type: "function",
 				Function: providers.ToolCallFunction{
-					Name:      fromQwenName(toolData.Name),
+					Name:      deName,
 					Arguments: string(argsJSON),
 				},
 			})
@@ -488,9 +496,13 @@ func coerceValue(v interface{}) interface{} {
 }
 
 // applyToolSpecificFixes applies per-tool parameter name mappings, defaults, and structure fixes
+// Tool name matching is case-insensitive to handle tools that come back from Qwen with different casing
 func applyToolSpecificFixes(name string, fixed map[string]interface{}) map[string]interface{} {
-	switch name {
-	case "AskUserQuestion":
+	// Normalize tool name to lowercase for matching, but preserve original for case-specific logic
+	nameLower := strings.ToLower(name)
+	
+	switch nameLower {
+	case "askuserquestion":
 		// Map singular 'question' to 'questions' array
 		if question, ok := fixed["question"]; ok && fixed["questions"] == nil {
 			fixed["questions"] = []interface{}{
@@ -521,7 +533,8 @@ func applyToolSpecificFixes(name string, fixed map[string]interface{}) map[strin
 			}
 		}
 
-	case "Read":
+	case "read":
+		// Handle both snake_case (from Qwen) and camelCase (expected by OpenCode)
 		if path, ok := fixed["path"]; ok {
 			fixed["file_path"] = path
 			delete(fixed, "path")
@@ -530,8 +543,14 @@ func applyToolSpecificFixes(name string, fixed map[string]interface{}) map[strin
 			fixed["file_path"] = filename
 			delete(fixed, "filename")
 		}
+		// Map Qwen's file_path to OpenCode's filePath
+		if filePath, ok := fixed["file_path"]; ok && fixed["filePath"] == nil {
+			fixed["filePath"] = filePath
+			delete(fixed, "file_path")
+			slog.Debug("Fixed Read: mapped file_path to filePath")
+		}
 
-	case "Bash":
+	case "bash":
 		if cmd, ok := fixed["cmd"]; ok {
 			fixed["command"] = cmd
 			delete(fixed, "cmd")
@@ -545,7 +564,7 @@ func applyToolSpecificFixes(name string, fixed map[string]interface{}) map[strin
 			slog.Debug("Fixed Bash: added default timeout 30000ms")
 		}
 
-	case "Agent":
+	case "agent":
 		if fixed["description"] == nil {
 			fixed["description"] = "Execute sub-task"
 		}
@@ -553,7 +572,7 @@ func applyToolSpecificFixes(name string, fixed map[string]interface{}) map[strin
 			fixed["prompt"] = fixed["description"]
 		}
 
-	case "Write":
+	case "write":
 		if path, ok := fixed["path"]; ok && fixed["file_path"] == nil {
 			fixed["file_path"] = path
 			delete(fixed, "path")
@@ -562,8 +581,13 @@ func applyToolSpecificFixes(name string, fixed map[string]interface{}) map[strin
 			fixed["content"] = text
 			delete(fixed, "text")
 		}
+		// Map file_path to filePath if needed
+		if filePath, ok := fixed["file_path"]; ok && fixed["filePath"] == nil {
+			fixed["filePath"] = filePath
+			delete(fixed, "file_path")
+		}
 
-	case "Edit":
+	case "edit":
 		if path, ok := fixed["path"]; ok && fixed["file_path"] == nil {
 			fixed["file_path"] = path
 			delete(fixed, "path")
@@ -576,8 +600,13 @@ func applyToolSpecificFixes(name string, fixed map[string]interface{}) map[strin
 			fixed["new_string"] = newStr
 			delete(fixed, "new")
 		}
+		// Map file_path to filePath if needed
+		if filePath, ok := fixed["file_path"]; ok && fixed["filePath"] == nil {
+			fixed["filePath"] = filePath
+			delete(fixed, "file_path")
+		}
 
-	case "Search", "Glob":
+	case "search", "glob":
 		if pattern, ok := fixed["pattern"]; ok && fixed["query"] == nil {
 			fixed["query"] = pattern
 		}

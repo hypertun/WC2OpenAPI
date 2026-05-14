@@ -17,6 +17,15 @@ import (
 	"github.com/user/wc2api/internal/toolcall"
 )
 
+// allowedAgentSubagentTypes lists the supported subagent_type values for Agent tool
+var allowedAgentSubagentTypes = map[string]bool{
+	"browser": true,
+	"general": true,
+	"code":    true,
+	"research": true,
+	// Add more as needed
+}
+
 const maxToolCallRetries = toolcall.DefaultMaxRetries
 
 // CreateChatCompletion creates a chat completion with Qwen
@@ -33,10 +42,18 @@ func (c *Client) chatWithRetry(ctx context.Context, req *providers.ChatRequest, 
 		return nil, fmt.Errorf("failed to refresh token: %w", err)
 	}
 
-	// Create chat session first
-	chatID, err := c.createChatSession()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create chat session: %w", err)
+	// Determine chat session: use explicit ChatID if provided, otherwise create new
+	var chatID string
+	var err error
+	if req.ChatID != "" {
+		chatID = req.ChatID
+		slog.Debug("Using provided chat ID", "chatID", chatID)
+	} else {
+		chatID, err = c.createChatSession()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create chat session: %w", err)
+		}
+		slog.Debug("Created new chat session", "chatID", chatID)
 	}
 
 	// Build request payload
@@ -82,6 +99,9 @@ func (c *Client) chatWithRetry(ctx context.Context, req *providers.ChatRequest, 
 
 	// Retry on invalid tool calls
 	validationErrors := validateToolCallsWithErrors(toolCalls, req.Tools)
+	// Additional tool-specific errors (e.g., Agent subagent_type)
+	agentErrors := validateAgentSubagentType(toolCalls)
+	validationErrors = append(validationErrors, agentErrors...)
 	if toolcall.ShouldRetry(validationErrors, retryCount, maxToolCallRetries) {
 		feedback := toolcall.GenerateToolCallErrorFeedback(validationErrors)
 		backoff := toolcall.CalculateBackoff(retryCount)
@@ -247,14 +267,19 @@ func (c *Client) streamWithRetry(ctx context.Context, req *providers.ChatRequest
 		return nil, fmt.Errorf("failed to refresh token: %w", err)
 	}
 
-	// Create chat session first
-	chatID, err := c.createChatSession()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create chat session: %w", err)
+	// Determine chat session: use explicit ChatID if provided, otherwise create new
+	var chatID string
+	var err error
+	if req.ChatID != "" {
+		chatID = req.ChatID
+		slog.Debug("Using provided chat ID", "chatID", chatID)
+	} else {
+		chatID, err = c.createChatSession()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create chat session: %w", err)
+		}
+		slog.Debug("Created new chat session", "chatID", chatID)
 	}
-
-	// Build request payload
-	payload := c.convertRequest(chatID, req)
 
 	// Create response channel
 	outChan := make(chan providers.StreamResponse, 10)
@@ -264,6 +289,9 @@ func (c *Client) streamWithRetry(ctx context.Context, req *providers.ChatRequest
 	go func() {
 		defer close(outChan)
 		validationStart := time.Now()
+
+		// Build request payload
+		payload := c.convertRequest(chatID, req)
 
 		httpReq, err := http.NewRequestWithContext(ctx, "POST", c.config.BaseURL+completionURL+"?chat_id="+chatID, bytes.NewReader(payload))
 		if err != nil {
@@ -440,6 +468,9 @@ func (c *Client) streamWithRetry(ctx context.Context, req *providers.ChatRequest
 		}
 
 		validationErrors := validateToolCallsWithErrors(toolCalls, req.Tools)
+		// Additional tool-specific errors (e.g., Agent subagent_type)
+		agentErrors := validateAgentSubagentType(toolCalls)
+		validationErrors = append(validationErrors, agentErrors...)
 		if parseErr == nil && toolcall.ShouldRetry(validationErrors, retryCount, maxToolCallRetries) {
 			feedback := toolcall.GenerateToolCallErrorFeedback(validationErrors)
 			backoff := toolcall.CalculateBackoff(retryCount)
@@ -675,7 +706,33 @@ func (c *Client) formatMessagesToPrompt(messages []providers.Message) string {
 			promptParts = append(promptParts, "Tool Result: "+string(msg.Content))
 		}
 	}
-	return strings.Join(promptParts, "\n\n")
+	return strings.Join(promptParts, "\n")
+}
+
+// validateAgentSubagentType checks for Agent tool calls with invalid subagent_type.
+func validateAgentSubagentType(calls []providers.ToolCall) []*toolcall.ValidationError {
+	var errs []*toolcall.ValidationError
+	for _, call := range calls {
+		if call.Function.Name == "Agent" {
+			var args map[string]interface{}
+			if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
+				continue
+			}
+			if subagent, ok := args["subagent_type"].(string); ok && subagent != "" {
+				if !allowedAgentSubagentTypes[subagent] {
+					errs = append(errs, &toolcall.ValidationError{
+						ToolName:  call.Function.Name,
+						Parameter: "subagent_type",
+						Expected:  "one of: browser, general, code, research",
+						Actual:    subagent,
+						Message:   fmt.Sprintf("unsupported subagent_type: %s", subagent),
+						Severity:  "error",
+					})
+				}
+			}
+		}
+	}
+	return errs
 }
 
 func generateMessageID() string {

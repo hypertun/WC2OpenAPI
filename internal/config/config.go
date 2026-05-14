@@ -29,25 +29,10 @@ type AuthConfig struct {
 
 // ProviderConfig holds provider-specific settings
 type ProviderConfig struct {
-	DeepSeek DeepSeekConfig `json:"deepseek"`
-Qwen     QwenConfig     `json:"qwen"`
-}
-
-// DeepSeekConfig holds DeepSeek provider settings
-// Timeout and TokenRefreshInterval are integers (seconds) in config.json per AGENTS.md
-type DeepSeekConfig struct {
-	Enabled              bool   `json:"enabled"`
-	Email                string `json:"email"`
-	Password             string `json:"password,omitempty"`
-	BaseURL              string `json:"base_url"`
-	LoginURL             string `json:"login_url"`
-	CreateSessionURL     string `json:"create_session_url"`
-	Timeout              int    `json:"timeout"`                // seconds
-	TokenRefreshInterval int    `json:"token_refresh_interval"` // seconds
+	Qwen     QwenConfig     `json:"qwen"`
 }
 
 // QwenConfig holds Qwen provider settings
-// Timeout and TokenRefreshInterval are integers (seconds) in config.json per AGENTS.md
 type QwenConfig struct {
 	Enabled              bool   `json:"enabled"`
 	Email                string `json:"email"`
@@ -55,6 +40,11 @@ type QwenConfig struct {
 	BaseURL              string `json:"base_url"`
 	Timeout              int    `json:"timeout"`                // seconds
 	TokenRefreshInterval int    `json:"token_refresh_interval"` // seconds
+	// Chat ID pre-warming settings
+	ChatIDPreWarmSize    int    `json:"chat_id_pre_warm_size"`    // number of chat IDs to pre-warm per account per model
+	ChatIDPreWarmInterval int   `json:"chat_id_pre_warm_interval"` // seconds between pre-warming cycles
+	ChatIDTTL            int    `json:"chat_id_ttl"`              // seconds until a pre-warmed chat ID expires
+	ChatIDPreWarmModels  []string `json:"chat_id_pre_warm_models"`  // list of Qwen model names to pre-warm for
 }
 
 // DefaultConfig returns a configuration with sensible defaults
@@ -70,19 +60,16 @@ func DefaultConfig() *Config {
 			APIKeys: []string{},
 		},
 		Provider: ProviderConfig{
-			DeepSeek: DeepSeekConfig{
-				Enabled:              true,
-				BaseURL:              "https://chat.deepseek.com",
-				LoginURL:             "/api/v0/users/login",
-				CreateSessionURL:     "/api/v0/chat/create_session",
-				Timeout:              120,  // seconds per AGENTS.md
-				TokenRefreshInterval: 1800, // 30 minutes in seconds
-			},
 			Qwen: QwenConfig{
 				Enabled:              false,
 				BaseURL:              "https://chat.qwen.ai",
 				Timeout:              120,  // seconds per AGENTS.md
 				TokenRefreshInterval: 1800, // 30 minutes in seconds
+				// Chat ID pre-warming settings
+				ChatIDPreWarmSize:    2,    // pre-warm 2 chat IDs per account per model
+				ChatIDPreWarmInterval: 300, // 5 minutes between pre-warming cycles
+				ChatIDTTL:            1800, // 30 minutes until a pre-warmed chat ID expires
+				ChatIDPreWarmModels:  []string{"qwen3.6-plus"}, // default model to pre-warm for
 			},
 		},
 	}
@@ -116,15 +103,6 @@ func Load(path string) (*Config, error) {
 func (c *Config) Validate() error {
 	if c.Server.Port == "" {
 		return fmt.Errorf("server port is required")
-	}
-
-	if c.Provider.DeepSeek.Enabled {
-		if c.Provider.DeepSeek.Email == "" {
-			return fmt.Errorf("deepseek email is required when deepseek is enabled")
-		}
-		if c.Provider.DeepSeek.Password == "" {
-			return fmt.Errorf("deepseek password is required when deepseek is enabled")
-		}
 	}
 
 	if c.Provider.Qwen.Enabled {

@@ -100,7 +100,7 @@ func TestCalculateBackoff_Monotonic(t *testing.T) {
 
 func TestBuildRetryRequest(t *testing.T) {
 	original := &providers.ChatRequest{
-		Model:       "deepseek-v4-flash",
+		Model:       "test-model",
 		Messages:    []providers.Message{{Role: "user", Content: "hello"}},
 		Tools:       nil,
 		ToolChoice:  "auto",

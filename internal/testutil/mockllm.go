@@ -41,50 +41,34 @@ func WriteSSE(w http.ResponseWriter, data string) {
 }
 
 // MalformedToolCallResponse returns a handler that returns a malformed tool call (missing required param).
-func MalformedToolCallResponse(provider string) http.HandlerFunc {
+func MalformedToolCallResponse(_ string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		if provider == "deepseek" {
-			w.Write([]byte(`{"choices":[{"message":{"content":"<|DSML|tool_calls><|DSML|invoke name=\"bash\"><|DSML|parameter name=\"description\"><![CDATA[test]]></|DSML|parameter></|DSML|invoke></|DSML|tool_calls>"}}]`))
-		} else {
-			w.Write([]byte(`{"choices":[{"message":{"content":"##TOOL_CALL##{\"name\":\"bash\",\"input\":{\"description\":\"test\"}}##END_CALL##"}}]`))
-		}
+		w.Write([]byte(`{"choices":[{"message":{"content":"##TOOL_CALL##{\"name\":\"bash\",\"input\":{\"description\":\"test\"}}##END_CALL##"}}]`))
 	}
 }
 
 // CorrectedToolCallResponse returns a handler that returns a corrected tool call.
-func CorrectedToolCallResponse(provider string) http.HandlerFunc {
+func CorrectedToolCallResponse(_ string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		if provider == "deepseek" {
-			w.Write([]byte(`{"choices":[{"message":{"content":"<|DSML|tool_calls><|DSML|invoke name=\"bash\"><|DSML|parameter name=\"command\"><![CDATA[ls -la]]></|DSML|parameter></|DSML|invoke></|DSML|tool_calls>"}}]`))
-		} else {
-			w.Write([]byte(`{"choices":[{"message":{"content":"##TOOL_CALL##{\"name\":\"bash\",\"input\":{\"command\":\"ls -la\"}}##END_CALL##"}}]`))
-		}
+		w.Write([]byte(`{"choices":[{"message":{"content":"##TOOL_CALL##{\"name\":\"bash\",\"input\":{\"command\":\"ls -la\"}}##END_CALL##"}}]`))
 	}
 }
 
 // StreamMalformedToolCall returns a handler for streaming malformed tool calls.
-func StreamMalformedToolCall(provider string) http.HandlerFunc {
+func StreamMalformedToolCall(_ string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		if provider == "deepseek" {
-			writeSSEWithContent(w, `{"choices":[{"delta":{"content":"<|DSML|tool_calls><|DSML|invoke name=\"bash\"><|DSML|parameter name=\"description\"><![CDATA[test]]></|DSML|parameter></|DSML|invoke></|DSML|tool_calls>"}}]}`)
-		} else {
-			writeSSEWithContent(w, `{"choices":[{"delta":{"content":"##TOOL_CALL##{\"name\":\"bash\",\"input\":{\"description\":\"test\"}}##END_CALL##","phase":"tool_call"}}]}`)
-		}
+		writeSSEWithContent(w, `{"choices":[{"delta":{"content":"##TOOL_CALL##{\"name\":\"bash\",\"input\":{\"description\":\"test\"}}##END_CALL##","phase":"tool_call"}}]}`)
 	}
 }
 
 // StreamCorrectedToolCall returns a handler for streaming corrected tool calls.
-func StreamCorrectedToolCall(provider string) http.HandlerFunc {
+func StreamCorrectedToolCall(_ string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		if provider == "deepseek" {
-			writeSSEWithContent(w, `{"choices":[{"delta":{"content":"<|DSML|tool_calls><|DSML|invoke name=\"bash\"><|DSML|parameter name=\"command\"><![CDATA[ls -la]]></|DSML|parameter></|DSML|invoke></|DSML|tool_calls>"}}]}`)
-		} else {
-			writeSSEWithContent(w, `{"choices":[{"delta":{"content":"##TOOL_CALL##{\"name\":\"bash\",\"input\":{\"command\":\"ls -la\"}}##END_CALL##","phase":"tool_call"}}]}`)
-		}
+		writeSSEWithContent(w, `{"choices":[{"delta":{"content":"##TOOL_CALL##{\"name\":\"bash\",\"input\":{\"command\":\"ls -la\"}}##END_CALL##","phase":"tool_call"}}]}`)
 	}
 }
 

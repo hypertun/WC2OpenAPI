@@ -8,6 +8,83 @@ import (
 	"github.com/user/wc2api/internal/providers"
 )
 
+// compressSchema converts a JSON Schema into a concise TypeScript-like signature.
+// Example: {"type":"object","properties":{"file_path":{"type":"string"},"encoding":{"type":"string","enum":["utf-8","base64"]}},"required":["file_path"]}
+// Output: {file_path!: string, encoding?: utf-8|base64}
+func compressSchema(schema map[string]interface{}) string {
+	if schema == nil {
+		return "{}"
+	}
+
+	propsRaw, ok := schema["properties"]
+	if !ok {
+		return "{}"
+	}
+	props, ok := propsRaw.(map[string]interface{})
+	if !ok || len(props) == 0 {
+		return "{}"
+	}
+
+	required := map[string]bool{}
+	if reqRaw, ok := schema["required"]; ok {
+		if reqList, ok := reqRaw.([]interface{}); ok {
+			for _, r := range reqList {
+				if s, ok := r.(string); ok {
+					required[s] = true
+				}
+			}
+		}
+	}
+
+	var paramStrs []string
+	// Sort property names for stable output
+	names := make([]string, 0, len(props))
+	for name := range props {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		propRaw := props[name]
+		prop, ok := propRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		// Get base type
+		paramType := "any"
+		if t, ok := prop["type"]; ok {
+			if ts, ok := t.(string); ok {
+				paramType = ts
+			}
+		}
+		// Handle enum
+		if enumRaw, ok := prop["enum"]; ok {
+			if enumList, ok := enumRaw.([]interface{}); ok {
+				enumStrs := make([]string, len(enumList))
+				for i, e := range enumList {
+					if es, ok := e.(string); ok {
+						enumStrs[i] = es
+					} else {
+						enumStrs[i] = fmt.Sprintf("%v", e)
+					}
+				}
+				if len(enumStrs) > 0 {
+					paramType = strings.Join(enumStrs, "|")
+				}
+			}
+		}
+		// Build parameter representation
+		reqMark := "?"
+		if required[name] {
+			reqMark = "!"
+		}
+		paramStrs = append(paramStrs, fmt.Sprintf("%s%s: %s", name, reqMark, paramType))
+	}
+
+	return "{" + strings.Join(paramStrs, ", ") + "}"
+}
+
+// Deprecated: use compressSchema instead. Kept for backward compatibility.
 func buildParameterHints(schema map[string]interface{}) string {
 	if schema == nil {
 		return ""
@@ -57,6 +134,7 @@ func buildParameterHints(schema map[string]interface{}) string {
 func toolDescriptionWithHints(tool providers.Tool) string {
 	name := tool.Function.Name
 	desc := tool.Function.Description
+	// Use parameter hints from schema
 	hints := buildParameterHints(tool.Function.Parameters)
 
 	var b strings.Builder
@@ -139,7 +217,7 @@ func BuildQwenToolCallInstructions(tools []providers.Tool) string {
 
 	b.WriteString("CORRECT EXAMPLE:\n")
 	b.WriteString("##TOOL_CALL##\n")
-	b.WriteString(`{"name": "Read", "input": {"file_path": "/path/to/file"}}` + "\n")
+	b.WriteString(`{"name": "Read", "input": {"filePath": "/path/to/file"}}` + "\n")
 	b.WriteString("##END_CALL##\n\n")
 
 	b.WriteString("MULTI-TURN RULES:\n")
@@ -164,7 +242,7 @@ func BuildQwenToolCallInstructions(tools []providers.Tool) string {
 	b.WriteString("- No extra parameters beyond those listed in the schema\n\n")
 
 	b.WriteString("COMMON MISTAKES:\n")
-	b.WriteString("- Wrong: " + `{"input": {"path": "/file"}}` + " — use \"file_path\", not \"path\"\n")
+	b.WriteString("- Wrong: " + `{"input": {"path": "/file"}}` + " — use \"filePath\", not \"path\"\n")
 	b.WriteString("- Wrong: " + `{"input": {"command": 123}}` + " — use a string, not a number\n")
 	b.WriteString("- Wrong: " + `{"input": {}}` + " (missing required params)\n")
 	b.WriteString("- Wrong: extra params not in schema\n\n")

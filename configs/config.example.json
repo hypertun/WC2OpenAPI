@@ -9,13 +9,6 @@
     "api_keys": []
   },
   "provider": {
-    "deepseek": {
-      "enabled": true,
-      "email": "your-email@example.com",
-      "password": "your-password",
-      "base_url": "https://chat.deepseek.com",
-      "timeout": 120
-    },
     "qwen": {
       "enabled": false,
       "email": "your-email@example.com",

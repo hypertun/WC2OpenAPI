@@ -7,7 +7,7 @@ WebChat to API - A lightweight Go middleware that converts AI webchat interfaces
 - 🔌 **OpenAI API compatible** - Drop-in replacement for OpenAI API
 - 🌊 **Streaming support** - Server-Sent Events (SSE) for real-time responses
 - 🔐 **Automated login** - Automatically authenticates with provider webchat
-- 🔌 **Multi-provider support** - DeepSeek and Qwen providers included
+- 🔌 **Multi-provider support** - Qwen and G365 providers included
 - 🔧 **Tool calling** - DSML and `##TOOL_CALL##` markup parsing for function calls
 - 📊 **Structured logging** - Debug tool call validation and retry metrics
 
@@ -15,8 +15,6 @@ WebChat to API - A lightweight Go middleware that converts AI webchat interfaces
 
 ```bash
 cp configs/config.example.json config.json
-export DEEPSEEK_EMAIL="your-email@example.com"
-export DEEPSEEK_PASSWORD="your-password"
 export QWEN_EMAIL="your-email@example.com"
 export QWEN_PASSWORD="your-password"
 go mod tidy
@@ -35,7 +33,6 @@ go build -o wc2api ./cmd/wc2api            # build binary
 ## Configuration
 
 - Copy `configs/config.example.json` to `config.json` and edit.
-- **DeepSeek Credentials**: Use env vars `DEEPSEEK_EMAIL` + `DEEPSEEK_PASSWORD` (not config file).
 - **Qwen Credentials**: Use env vars `QWEN_EMAIL` + `QWEN_PASSWORD` (not config file).
 - **Timeouts**: All values in `config.json` are **integers (seconds)**, not Go duration strings.
 - **API keys**: Set `auth.api_keys` to enforce API key auth; empty list = bypass (dev mode).
@@ -50,35 +47,27 @@ go build -o wc2api ./cmd/wc2api            # build binary
 
 ## Supported Models
 
-### DeepSeek
-- `deepseek-v4-flash` — Fast general chat model (model_type: default)
-- `deepseek-v4-pro` — Expert model with enhanced capabilities (model_type: expert)
-- `deepseek-v4-flash-nothinking` / `deepseek-v4-pro-nothinking` — Disable thinking/reasoning (suffix stripped before sending)
-
 ### Qwen
+
 - `qwen3.5-flash` — Fast general chat model (model_type: default)
 - `qwen3.6-plus` — Enhanced model with more capabilities (model_type: expert)
 - `qwen3.5-flash-nothinking` / `qwen3.6-plus-nothinking` — Disable thinking/reasoning (suffix stripped before sending)
 
 ### Microsoft 365 Copilot (G365)
+
 - `gpt-5.5-quick` — Fast chat model (tone: `Gpt_5_5_Chat`)
 - `gpt-5.5-think-deeper` — Reasoning model with deeper thinking (tone: `Gpt_5_5_Reasoning`)
 - `gpt-5.5-quick-nothinking` / `gpt-5.5-think-deeper-nothinking` — Disable thinking/reasoning variants
 
 ## Provider Support
 
-All three providers can be enabled simultaneously:
-- **Model routing**: Requests route based on model name prefix (`deepseek-*` → DeepSeek, `qwen-*` → Qwen, `gpt-5.5-*` → G365)
+All providers can be enabled simultaneously:
+- **Model routing**: Requests route based on model name prefix (`qwen-*` → Qwen, `gpt-5.5-*` → G365)
 - **Fallback**: Unrecognized model names use the first available provider
 
 ## Tool Calling
 
-All three providers support function calling with different formats:
-
-**DeepSeek:**
-- DSML markup (`<|DSML|tool_calls><|DSML|invoke name="...">`) parsing
-- Tool schemas injected into system message as DSML instructions
-- Buffers full response before extracting tool calls
+All providers support function calling with different formats:
 
 **Qwen:**
 - `##TOOL_CALL##` / `##END_CALL##` marker parsing
@@ -106,9 +95,9 @@ wc2api
     ├─ OpenAI API Handlers
     └─ Provider Interface
          ↓
-    DeepSeek Provider / Qwen Provider
+    Qwen Provider / G365 Provider
          ↓ Web Protocol
-    chat.deepseek.com / chat.qwen.ai
+    chat.qwen.ai / (browser-based)
 ```
 
 ## Project Structure
@@ -120,7 +109,6 @@ internal/
     middleware/
   handlers/                # OpenAI-compatible HTTP handlers (health, models, chat)
   providers/               # Provider interface + shared types
-    deepseek/              # DeepSeek webchat implementation (DS2API-style)
     qwen/                  # Qwen webchat implementation (API-based auth)
     g365/                  # Microsoft 365 Copilot (browser automation via chromedp)
       browser.go           # Chromium context management, bridge injection
@@ -137,7 +125,6 @@ configs/                   # Config templates (example only)
 
 - **chi v5** router
 - **go-chi/cors** for CORS  
-- **refraction-networking/utls** for TLS fingerprint spoofing (DeepSeek, Safari-like, HTTP/1.1-only to bypass WAF)
 
 ## Constraints
 

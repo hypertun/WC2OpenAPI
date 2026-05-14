@@ -138,6 +138,8 @@ type ChatRequest struct {
 	Stream      bool      `json:"stream,omitempty"`
 	Tools       []Tool    `json:"tools,omitempty"`
 	ToolChoice  ToolChoice `json:"tool_choice,omitempty"`
+	// ChatID allows reusing an existing chat session (optional)
+	ChatID string `json:"chat_id,omitempty"`
 }
 
 // ChatResponse represents a chat completion response
