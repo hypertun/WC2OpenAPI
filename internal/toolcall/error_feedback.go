@@ -19,8 +19,12 @@ func GenerateToolCallErrorFeedback(errors []*ValidationError) string {
 		if key == "" {
 			key = "unknown"
 		}
-		msg := fmt.Sprintf("  - `%s`: %s (expected: %s, got: %v)",
-			err.Parameter, err.Message, err.Expected, err.Actual)
+		var paramStr string
+		if err.Parameter != "" {
+			paramStr = fmt.Sprintf("`%s`: ", err.Parameter)
+		}
+		msg := fmt.Sprintf("  - %s%s (expected: %s, got: %v)",
+			paramStr, err.Message, err.Expected, err.Actual)
 		toolErrors[key] = append(toolErrors[key], msg)
 		totalErrors++
 	}

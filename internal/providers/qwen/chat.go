@@ -19,9 +19,9 @@ import (
 
 // allowedAgentSubagentTypes lists the supported subagent_type values for Agent tool
 var allowedAgentSubagentTypes = map[string]bool{
-	"browser": true,
-	"general": true,
-	"code":    true,
+	"browser":  true,
+	"general":  true,
+	"code":     true,
 	"research": true,
 	// Add more as needed
 }
@@ -42,14 +42,14 @@ func (c *Client) chatWithRetry(ctx context.Context, req *providers.ChatRequest, 
 		return nil, fmt.Errorf("failed to refresh token: %w", err)
 	}
 
-	// Determine chat session: use explicit ChatID if provided, otherwise create new
+	// Determine chat session: use explicit ChatID if provided, otherwise get from pool
 	var chatID string
 	var err error
 	if req.ChatID != "" {
 		chatID = req.ChatID
 		slog.Debug("Using provided chat ID", "chatID", chatID)
 	} else {
-		chatID, err = c.createChatSession()
+		chatID, err = c.createChatSession(c.projectID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create chat session: %w", err)
 		}
@@ -95,13 +95,14 @@ func (c *Client) chatWithRetry(ctx context.Context, req *providers.ChatRequest, 
 	slog.Debug("Qwen completion response", "body_preview", string(body)[:min(len(body), 500)])
 
 	// Parse SSE content
-	content, reasoningContent, toolCalls := parseSSEContent(string(body), req.Tools)
+	content, reasoningContent, toolCalls, parseErrors, responseFID := parseSSEContent(string(body), req.Tools)
 
 	// Retry on invalid tool calls
 	validationErrors := validateToolCallsWithErrors(toolCalls, req.Tools)
 	// Additional tool-specific errors (e.g., Agent subagent_type)
 	agentErrors := validateAgentSubagentType(toolCalls)
 	validationErrors = append(validationErrors, agentErrors...)
+	validationErrors = append(validationErrors, parseErrors...)
 	if toolcall.ShouldRetry(validationErrors, retryCount, maxToolCallRetries) {
 		feedback := toolcall.GenerateToolCallErrorFeedback(validationErrors)
 		backoff := toolcall.CalculateBackoff(retryCount)
@@ -171,15 +172,23 @@ func (c *Client) chatWithRetry(ctx context.Context, req *providers.ChatRequest, 
 		chatResp.Choices[0].Message.ReasoningContent = reasoningContent
 	}
 
+	// Store response FID for conversation continuity
+	if responseFID != "" && chatID != "" {
+		c.responseIDMu.Lock()
+		c.responseIDs[chatID] = responseFID
+		c.responseIDMu.Unlock()
+	}
+
 	return chatResp, nil
 }
 
 // parseSSEContent extracts content from SSE response
-// Returns content, reasoningContent, and optionally tool calls
-func parseSSEContent(sseBody string, tools []providers.Tool) (string, string, []providers.ToolCall) {
+// Returns content, reasoningContent, tool calls, parse errors, and response message FID
+func parseSSEContent(sseBody string, tools []providers.Tool) (string, string, []providers.ToolCall, []*toolcall.ValidationError, string) {
 	lines := strings.Split(sseBody, "\n")
 	var content, reasoning strings.Builder
 	var allToolCalls []providers.ToolCall
+	var responseFID string
 
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -194,6 +203,7 @@ func parseSSEContent(sseBody string, tools []providers.Tool) (string, string, []
 
 		// Parse JSON
 		var evt struct {
+			ID      string `json:"id"`
 			Choices []struct {
 				Delta struct {
 					Content string                 `json:"content"`
@@ -206,6 +216,10 @@ func parseSSEContent(sseBody string, tools []providers.Tool) (string, string, []
 
 		if err := json.Unmarshal([]byte(data), &evt); err != nil {
 			continue
+		}
+
+		if responseFID == "" && evt.ID != "" {
+			responseFID = evt.ID
 		}
 
 		if len(evt.Choices) == 0 {
@@ -233,24 +247,23 @@ func parseSSEContent(sseBody string, tools []providers.Tool) (string, string, []
 	fullText := strings.TrimSpace(content.String() + reasoning.String())
 
 	// Check for ##TOOL_CALL## markers in the full text
-	toolCalls, err := parseToolCallsFromText(fullText, tools)
-	if err != nil {
-		slog.Debug("Failed to parse tool calls from text", "error", err)
-	}
+	toolCalls, parseErrors := parseToolCallsFromText(fullText, tools)
 
-	if len(toolCalls) > 0 {
-		toolNames := make([]string, len(toolCalls))
-		for i, tc := range toolCalls {
-			toolNames[i] = tc.Function.Name
+	if len(toolCalls) > 0 || len(parseErrors) > 0 {
+		if len(toolCalls) > 0 {
+			toolNames := make([]string, len(toolCalls))
+			for i, tc := range toolCalls {
+				toolNames[i] = tc.Function.Name
+			}
+			slog.Info("Tool calls received",
+				"count", len(toolCalls),
+				"tools", toolNames,
+			)
 		}
-		slog.Info("Tool calls received",
-			"count", len(toolCalls),
-			"tools", toolNames,
-		)
-		return "", "", toolCalls
+		return "", "", toolCalls, parseErrors, responseFID
 	}
 
-	return strings.TrimSpace(content.String()), strings.TrimSpace(reasoning.String()), allToolCalls
+	return strings.TrimSpace(content.String()), strings.TrimSpace(reasoning.String()), allToolCalls, nil, responseFID
 }
 
 // CreateChatCompletionStream creates a streaming chat completion with Qwen
@@ -267,14 +280,14 @@ func (c *Client) streamWithRetry(ctx context.Context, req *providers.ChatRequest
 		return nil, fmt.Errorf("failed to refresh token: %w", err)
 	}
 
-	// Determine chat session: use explicit ChatID if provided, otherwise create new
+	// Determine chat session: use explicit ChatID if provided, otherwise get from pool
 	var chatID string
 	var err error
 	if req.ChatID != "" {
 		chatID = req.ChatID
 		slog.Debug("Using provided chat ID", "chatID", chatID)
 	} else {
-		chatID, err = c.createChatSession()
+		chatID, err = c.createChatSession(c.projectID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create chat session: %w", err)
 		}
@@ -357,6 +370,7 @@ func (c *Client) streamWithRetry(ctx context.Context, req *providers.ChatRequest
 		var contentBuffer strings.Builder
 		var sawToolCallPhase bool
 		var allChunks []string
+		var responseFID string
 
 		for {
 			line, err := reader.ReadString('\n')
@@ -382,6 +396,7 @@ func (c *Client) streamWithRetry(ctx context.Context, req *providers.ChatRequest
 			}
 
 			var evt struct {
+				ID      string `json:"id"`
 				Choices []struct {
 					Delta struct {
 						Content string                 `json:"content"`
@@ -394,6 +409,10 @@ func (c *Client) streamWithRetry(ctx context.Context, req *providers.ChatRequest
 
 			if err := json.Unmarshal([]byte(data), &evt); err != nil {
 				continue
+			}
+
+			if responseFID == "" && evt.ID != "" {
+				responseFID = evt.ID
 			}
 
 			if len(evt.Choices) == 0 {
@@ -452,7 +471,7 @@ func (c *Client) streamWithRetry(ctx context.Context, req *providers.ChatRequest
 		fullText := contentBuffer.String()
 		slog.Debug("Stream end processing", "sawToolCallPhase", sawToolCallPhase, "buffer_len", len(fullText))
 
-		toolCalls, parseErr := parseToolCallsFromText(fullText, req.Tools)
+		toolCalls, parseErrors := parseToolCallsFromText(fullText, req.Tools)
 
 		// Log original tool call structure
 		if len(toolCalls) > 0 {
@@ -471,7 +490,8 @@ func (c *Client) streamWithRetry(ctx context.Context, req *providers.ChatRequest
 		// Additional tool-specific errors (e.g., Agent subagent_type)
 		agentErrors := validateAgentSubagentType(toolCalls)
 		validationErrors = append(validationErrors, agentErrors...)
-		if parseErr == nil && toolcall.ShouldRetry(validationErrors, retryCount, maxToolCallRetries) {
+		validationErrors = append(validationErrors, parseErrors...)
+		if toolcall.ShouldRetry(validationErrors, retryCount, maxToolCallRetries) {
 			feedback := toolcall.GenerateToolCallErrorFeedback(validationErrors)
 			backoff := toolcall.CalculateBackoff(retryCount)
 
@@ -505,6 +525,13 @@ func (c *Client) streamWithRetry(ctx context.Context, req *providers.ChatRequest
 			)
 		}
 
+		// Store response FID for conversation continuity
+		if responseFID != "" && chatID != "" {
+			c.responseIDMu.Lock()
+			c.responseIDs[chatID] = responseFID
+			c.responseIDMu.Unlock()
+		}
+
 		// Log performance metrics
 		if retryCount > 0 || len(toolCalls) > 0 {
 			slog.Info("Tool call metrics",
@@ -516,9 +543,46 @@ func (c *Client) streamWithRetry(ctx context.Context, req *providers.ChatRequest
 			)
 		}
 
-		// Send response: either replay buffered chunks or send final chunk
-		if needBuffer && !sawToolCallPhase {
-			// Tools present but no tool call phase — replay buffered content
+		// Send response: tool call chunks take priority over content replay
+		if len(toolCalls) > 0 {
+			// Set index on each tool call (required for streaming delta format)
+			toolCallsWithIndex := make([]providers.ToolCall, len(toolCalls))
+			for i := range toolCalls {
+				idx := i
+				toolCallsWithIndex[i] = toolCalls[i]
+				toolCallsWithIndex[i].Index = &idx
+			}
+
+			// First chunk: role + tool_calls with all data
+			outChan <- providers.StreamResponse{
+				ID:      msgID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   req.Model,
+				Choices: []providers.StreamChoice{
+					{
+						Index: 0,
+						Delta: providers.Delta{
+							Role:      "assistant",
+							ToolCalls: toolCallsWithIndex,
+						},
+					},
+				},
+			}
+
+			// Final empty chunk with finish_reason
+			finishReason := "tool_calls"
+			outChan <- providers.StreamResponse{
+				ID:      msgID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   req.Model,
+				Choices: []providers.StreamChoice{
+					{Index: 0, Delta: providers.Delta{}, FinishReason: &finishReason},
+				},
+			}
+		} else if needBuffer {
+			// Tools present but no tool call detected — replay buffered content
 			for _, chunk := range allChunks {
 				outChan <- providers.StreamResponse{
 					ID:      msgID,
@@ -543,23 +607,6 @@ func (c *Client) streamWithRetry(ctx context.Context, req *providers.ChatRequest
 					{Index: 0, Delta: providers.Delta{}, FinishReason: &finishReason},
 				},
 			}
-		} else if sawToolCallPhase && len(toolCalls) > 0 {
-			// Tool calls detected — send single tool call chunk
-			outChan <- providers.StreamResponse{
-				ID:      msgID,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   req.Model,
-				Choices: []providers.StreamChoice{
-					{
-						Index: 0,
-						Delta: providers.Delta{
-							ToolCalls: toolCalls,
-						},
-						FinishReason: stringPtr("tool_calls"),
-					},
-				},
-			}
 		} else {
 			// No tool calls, content already streamed (or empty)
 			finishReason := "stop"
@@ -578,16 +625,10 @@ func (c *Client) streamWithRetry(ctx context.Context, req *providers.ChatRequest
 	return outChan, nil
 }
 
-
 // convertRequest converts OpenAI request to Qwen format
 func (c *Client) convertRequest(chatID string, req *providers.ChatRequest) []byte {
 	// Map model name
 	model := req.Model
-	// Strip -nothinking suffix if present to get actual Qwen model name
-	isNoThinking := strings.HasSuffix(model, "-nothinking")
-	if isNoThinking {
-		model = strings.TrimSuffix(model, "-nothinking")
-	}
 	// Qwen uses model names like qwen3.5-flash, qwen3.6-plus (hyphens kept)
 
 	// Format messages to prompt string
@@ -599,23 +640,33 @@ func (c *Client) convertRequest(chatID string, req *providers.ChatRequest) []byt
 	// Format messages into Qwen's expected format
 	prompt := c.formatMessagesToPrompt(messages)
 
+	// Look up stored response FID for parent chaining (conversation continuity)
+	var parentID interface{}
+	if chatID != "" {
+		c.responseIDMu.RLock()
+		if fid, ok := c.responseIDs[chatID]; ok {
+			parentID = fid
+		}
+		c.responseIDMu.RUnlock()
+	}
+
 	// Build Qwen-specific payload (from qwen2api payload_builder.py)
 	timestamp := time.Now().Unix()
 
 	// Determine feature config: base values + low-latency override when tools are present
-	featureConfig := map[string]interface{}{
-		"thinking_enabled":       !isNoThinking,
-		"output_schema":         "phase",
-		"research_mode":         "normal",
-		"auto_thinking":         !isNoThinking,
-		"thinking_mode":         "Auto",
-		"thinking_format":       "summary",
-		"auto_search":           false,
-		"code_interpreter":      false,
-		"plugins_enabled":       false,
-		"function_calling":     false, // Disable native function calling to avoid interception
-		"enable_tools":         false, // Disable native tools
-		"enable_function_call": false, // Disable native function calls
+	featureConfig := map[string]any{
+		"thinking_enabled":     true,
+		"output_schema":        "phase",
+		"research_mode":        "normal",
+		"auto_thinking":        true,
+		"thinking_mode":        "Thinking",
+		"thinking_format":      "summary",
+		"auto_search":          true,
+		"code_interpreter":     true,
+		"plugins_enabled":      false,
+		"function_calling":     true,   // Disable native function calling to avoid interception
+		"enable_tools":         true,   // Disable native tools
+		"enable_function_call": true,   // Disable native function calls
 		"tool_choice":          "none", // Prevent upstream interception
 	}
 
@@ -626,34 +677,34 @@ func (c *Client) convertRequest(chatID string, req *providers.ChatRequest) []byt
 		featureConfig["auto_thinking"] = false
 	}
 
-	payload := map[string]interface{}{
-		"stream":            true,
-		"version":           "2.1",
+	payload := map[string]any{
+		"stream":             true,
+		"version":            "2.1",
 		"incremental_output": true,
-		"chat_id":           chatID,
-		"chat_mode":         "normal",
-		"model":             model,
-		"parent_id":         nil,
-		"messages": []map[string]interface{}{
+		"chat_id":            chatID,
+		"chat_mode":          "normal",
+		"model":              model,
+		"parent_id":          parentID,
+		"messages": []map[string]any{
 			{
-				"fid":          fmt.Sprintf("%d", time.Now().UnixNano()),
-				"parentId":     nil,
-				"childrenIds":  []string{fmt.Sprintf("%d", time.Now().UnixNano()+1)},
-				"role":         "user",
-				"content":      prompt,
-				"user_action":  "chat",
-				"files":        []interface{}{},
-				"timestamp":    timestamp,
-				"models":       []string{model},
-				"chat_type":    "t2t",
+				"fid":            fmt.Sprintf("%d", time.Now().UnixNano()),
+				"parentId":       parentID,
+				"childrenIds":    []string{fmt.Sprintf("%d", time.Now().UnixNano()+1)},
+				"role":           "user",
+				"content":        prompt,
+				"user_action":    "chat",
+				"files":          []any{},
+				"timestamp":      timestamp,
+				"models":         []string{model},
+				"chat_type":      "t2t",
 				"feature_config": featureConfig,
-				"extra": map[string]interface{}{
-					"meta": map[string]interface{}{
+				"extra": map[string]any{
+					"meta": map[string]any{
 						"subChatType": "t2t",
 					},
 				},
 				"sub_chat_type": "t2t",
-				"parent_id":     nil,
+				"parent_id":     parentID,
 			},
 		},
 		"timestamp": timestamp,
@@ -746,27 +797,17 @@ func getReqID(ctx context.Context) string {
 	return "unknown"
 }
 
-func stringPtr(s string) *string {
-	return &s
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 // createChatSession creates a new chat session
-func (c *Client) createChatSession() (string, error) {
+func (c *Client) createChatSession(projectID string) (string, error) {
 	// Create chat session via Qwen API
 	ts := time.Now().Unix()
-	body := map[string]interface{}{
-		"title":    fmt.Sprintf("api_%d", ts),
-		"models":   []string{},
-		"chat_mode": "normal",
-		"chat_type": "t2t",
-		"timestamp": ts,
+	body := map[string]any{
+		"title":      fmt.Sprintf("api_%d", ts),
+		"models":     []string{},
+		"chat_mode":  "normal",
+		"chat_type":  "t2t",
+		"project_id": projectID,
+		"timestamp":  ts,
 	}
 
 	jsonBody, _ := json.Marshal(body)

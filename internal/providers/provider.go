@@ -44,6 +44,13 @@ func (m *MessageContent) UnmarshalJSON(data []byte) error {
 	return fmt.Errorf("invalid content type: %s", string(data))
 }
 
+func (m MessageContent) MarshalJSON() ([]byte, error) {
+	if m == "" {
+		return []byte("null"), nil
+	}
+	return json.Marshal(string(m))
+}
+
 // Message represents a chat message
 type Message struct {
 	Role             string         `json:"role"`
@@ -67,9 +74,11 @@ type ToolFunction struct {
 }
 
 // ToolCall represents a tool call in a message
+// Index is used in streaming deltas to correlate partial arguments across chunks
 type ToolCall struct {
-	ID       string          `json:"id"`
-	Type     string          `json:"type"` // "function"
+	Index    *int             `json:"index,omitempty"`
+	ID       string           `json:"id"`
+	Type     string           `json:"type"` // "function"
 	Function ToolCallFunction `json:"function"`
 }
 

@@ -11,6 +11,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/user/wc2api/internal/config"
@@ -26,12 +27,15 @@ const (
 
 // Client handles Qwen webchat interactions with API-based authentication
 type Client struct {
-	config     config.QwenConfig
-	httpClient *http.Client
-	baseURL    *url.URL
-	authToken  string
-	loggedIn   bool
-	lastLogin  time.Time
+	config       config.QwenConfig
+	projectID    string
+	httpClient   *http.Client
+	baseURL      *url.URL
+	authToken    string
+	loggedIn     bool
+	lastLogin    time.Time
+	responseIDMu sync.RWMutex
+	responseIDs  map[string]string // chatID → last assistant response message FID
 }
 
 // New creates a new Qwen client with API-based authentication
@@ -53,9 +57,11 @@ func New(cfg config.QwenConfig) (*Client, error) {
 	}
 
 	client := &Client{
-		config:     cfg,
-		baseURL:    baseURL,
-		httpClient: httpClient,
+		config:      cfg,
+		projectID:   cfg.ProjectID,
+		baseURL:     baseURL,
+		httpClient:  httpClient,
+		responseIDs: make(map[string]string),
 	}
 
 	if err := client.login(); err != nil {
@@ -70,7 +76,7 @@ func (c *Client) Name() string {
 	return "qwen"
 }
 
-// Close cleans up the provider (no-op for API-based auth)
+// Close cleans up the provider
 func (c *Client) Close() error {
 	return nil
 }

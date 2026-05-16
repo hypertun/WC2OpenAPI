@@ -14,8 +14,6 @@ import (
 var fallbackModels = []providers.Model{
 	{ID: "qwen3.5-flash", Object: "model", Created: 1704067200, OwnedBy: "qwen"},
 	{ID: "qwen3.6-plus", Object: "model", Created: 1704067200, OwnedBy: "qwen"},
-	{ID: "qwen3.5-flash-nothinking", Object: "model", Created: 1704067200, OwnedBy: "qwen"},
-	{ID: "qwen3.6-plus-nothinking", Object: "model", Created: 1704067200, OwnedBy: "qwen"},
 }
 
 // ListModels returns available models from Qwen
@@ -74,21 +72,5 @@ func (c *Client) fetchModelsFromAPI(ctx context.Context) ([]providers.Model, err
 		return nil, err
 	}
 
-	// Add -nothinking variants
-	return appendNoThinkingVariants(result.Data), nil
-}
-
-// appendNoThinkingVariants adds -nothinking variants for each model
-func appendNoThinkingVariants(models []providers.Model) []providers.Model {
-	result := make([]providers.Model, len(models)*2)
-	for i, m := range models {
-		result[i*2] = m
-		result[i*2+1] = providers.Model{
-			ID:      m.ID + "-nothinking",
-			Object:  m.Object,
-			Created: m.Created,
-			OwnedBy: m.OwnedBy,
-		}
-	}
-	return result
+	return result.Data, nil
 }

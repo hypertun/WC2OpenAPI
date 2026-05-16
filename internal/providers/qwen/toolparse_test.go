@@ -13,9 +13,9 @@ import (
 func TestParseToolCallsMultiple(t *testing.T) {
 	text := `##TOOL_CALL##{"name":"calculator","input":{"expr":"2+2"}}##END_CALL## ##TOOL_CALL##{"name":"Bash","input":{"command":"ls"}}##END_CALL##`
 
-	calls, err := parseToolCallsFromText(text, nil)
-	if err != nil {
-		t.Fatalf("parseToolCallsFromText error: %v", err)
+	calls, parseErrors := parseToolCallsFromText(text, nil)
+	if len(parseErrors) > 0 {
+		t.Fatalf("parseToolCallsFromText errors: %v", parseErrors)
 	}
 	if len(calls) != 2 {
 		t.Errorf("expected 2 tool calls, got %d", len(calls))
@@ -31,9 +31,9 @@ func TestParseToolCallsMultiple(t *testing.T) {
 func TestParseToolCallsSingleLine(t *testing.T) {
 	text := `##TOOL_CALL##{"name":"calculator","input":{"expr":"2+2"}}##END_CALL##`
 
-	calls, err := parseToolCallsFromText(text, nil)
-	if err != nil {
-		t.Fatalf("parseToolCallsFromText error: %v", err)
+	calls, parseErrors := parseToolCallsFromText(text, nil)
+	if len(parseErrors) > 0 {
+		t.Fatalf("parseToolCallsFromText errors: %v", parseErrors)
 	}
 	if len(calls) != 1 {
 		t.Errorf("expected 1 tool call, got %d", len(calls))
@@ -48,9 +48,9 @@ func TestParseToolCallsMultiline(t *testing.T) {
 {"name":"calculator","input":{"expr":"2+2"}}
 ##END_CALL##`
 
-	calls, err := parseToolCallsFromText(text, nil)
-	if err != nil {
-		t.Fatalf("parseToolCallsFromText error: %v", err)
+	calls, parseErrors := parseToolCallsFromText(text, nil)
+	if len(parseErrors) > 0 {
+		t.Fatalf("parseToolCallsFromText errors: %v", parseErrors)
 	}
 	if len(calls) != 1 {
 		t.Errorf("expected 1 tool call, got %d", len(calls))
@@ -60,9 +60,9 @@ func TestParseToolCallsMultiline(t *testing.T) {
 func TestParseToolCallsTypoLeading(t *testing.T) {
 	text := `TOOL_CALL##{"name":"calculator","input":{"expr":"2+2"}}##END_CALL##`
 
-	calls, err := parseToolCallsFromText(text, nil)
-	if err != nil {
-		t.Fatalf("parseToolCallsFromText error: %v", err)
+	calls, parseErrors := parseToolCallsFromText(text, nil)
+	if len(parseErrors) > 0 {
+		t.Fatalf("parseToolCallsFromText errors: %v", parseErrors)
 	}
 	if len(calls) != 1 {
 		t.Errorf("expected 1 tool call, got %d", len(calls))
@@ -72,9 +72,9 @@ func TestParseToolCallsTypoLeading(t *testing.T) {
 func TestParseToolCallsTypoTrailing(t *testing.T) {
 	text := `##TOOL_CALL##{"name":"calculator","input":{"expr":"2+2"}}##END_CALL`
 
-	calls, err := parseToolCallsFromText(text, nil)
-	if err != nil {
-		t.Fatalf("parseToolCallsFromText error: %v", err)
+	calls, parseErrors := parseToolCallsFromText(text, nil)
+	if len(parseErrors) > 0 {
+		t.Fatalf("parseToolCallsFromText errors: %v", parseErrors)
 	}
 	if len(calls) != 1 {
 		t.Errorf("expected 1 tool call, got %d", len(calls))
@@ -84,9 +84,9 @@ func TestParseToolCallsTypoTrailing(t *testing.T) {
 func TestParseToolCallsTypoSpace(t *testing.T) {
 	text := `##END CALL##{"name":"calculator","input":{"expr":"2+2"}}##TOOL_CALL##`
 
-	calls, err := parseToolCallsFromText(text, nil)
-	if err != nil {
-		t.Fatalf("parseToolCallsFromText error: %v", err)
+	calls, parseErrors := parseToolCallsFromText(text, nil)
+	if len(parseErrors) > 0 {
+		t.Fatalf("parseToolCallsFromText errors: %v", parseErrors)
 	}
 	if len(calls) != 1 {
 		t.Errorf("expected 1 tool call, got %d", len(calls))
@@ -96,9 +96,9 @@ func TestParseToolCallsTypoSpace(t *testing.T) {
 func TestParseToolCallsNoToolCalls(t *testing.T) {
 	text := "Just a regular response without tool calls"
 
-	calls, err := parseToolCallsFromText(text, nil)
-	if err != nil {
-		t.Fatalf("parseToolCallsFromText error: %v", err)
+	calls, parseErrors := parseToolCallsFromText(text, nil)
+	if len(parseErrors) > 0 {
+		t.Fatalf("parseToolCallsFromText errors: %v", parseErrors)
 	}
 	if calls != nil && len(calls) > 0 {
 		t.Errorf("expected no tool calls, got %d", len(calls))
@@ -106,9 +106,9 @@ func TestParseToolCallsNoToolCalls(t *testing.T) {
 }
 
 func TestParseToolCallsEmpty(t *testing.T) {
-	calls, err := parseToolCallsFromText("", nil)
-	if err != nil {
-		t.Fatalf("parseToolCallsFromText error: %v", err)
+	calls, parseErrors := parseToolCallsFromText("", nil)
+	if len(parseErrors) > 0 {
+		t.Fatalf("parseToolCallsFromText errors: %v", parseErrors)
 	}
 	if calls != nil {
 		t.Errorf("expected nil calls for empty input, got %v", calls)
@@ -203,9 +203,9 @@ func TestParseToolCallMarkers_QwenObfuscatedRead(t *testing.T) {
 {"name": "u_read", "input": {"file_path": "/Users/ivanyeo/Progects/WC2OpenAPI/TOOLCALL_GAPS.md"}}
 ##END_CALL##`
 
-	calls, err := parseToolCallsFromText(text, nil)
-	if err != nil {
-		t.Fatalf("parseToolCallsFromText error: %v", err)
+	calls, parseErrors := parseToolCallsFromText(text, nil)
+	if len(parseErrors) > 0 {
+		t.Fatalf("parseToolCallsFromText errors: %v", parseErrors)
 	}
 
 	if len(calls) != 1 {
@@ -246,9 +246,9 @@ func TestParseToolCallMarkers_WriteWithFilePathToFilePath(t *testing.T) {
 {"name": "fs_put_file", "input": {"file_path": "/tmp/test.txt", "content": "hello"}}
 ##END_CALL##`
 
-	calls, err := parseToolCallsFromText(text, nil)
-	if err != nil {
-		t.Fatalf("parseToolCallsFromText error: %v", err)
+	calls, parseErrors := parseToolCallsFromText(text, nil)
+	if len(parseErrors) > 0 {
+		t.Fatalf("parseToolCallsFromText errors: %v", parseErrors)
 	}
 
 	if len(calls) != 1 {
