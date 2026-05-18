@@ -11,5 +11,5 @@ require (
 
 require (
 	github.com/cespare/xxhash/v2 v2.1.2 // indirect
-	github.com/coocood/freecache v1.2.7 // indirect
+	github.com/coocood/freecache v1.2.7
 )
