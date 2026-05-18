@@ -10,29 +10,37 @@ import (
 	providers "github.com/user/wc2api/internal/providers"
 )
 
+const modelCacheTTL = 3600 // 1 hour in seconds
+
 // Qwen model names (fallback if API is unreachable)
 var fallbackModels = []providers.Model{
 	{ID: "qwen3.5-flash", Object: "model", Created: 1704067200, OwnedBy: "qwen"},
 	{ID: "qwen3.6-plus", Object: "model", Created: 1704067200, OwnedBy: "qwen"},
 }
 
-// ListModels returns available models from Qwen
-// Tries dynamic fetch from API first, falls back to hardcoded list
+// ListModels returns available models from Qwen with 1-hour freecache.
+// Tries dynamic fetch from API first, falls back to hardcoded list.
 func (c *Client) ListModels() []providers.Model {
+	if data, err := c.modelCache.Get([]byte("models")); err == nil {
+		var models []providers.Model
+		if err := json.Unmarshal(data, &models); err == nil {
+			return models
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	models, err := c.fetchModelsFromAPI(ctx)
-	if err != nil {
-		slog.Warn("Failed to fetch models from API, using fallback", "error", err)
-		return fallbackModels
+	if err != nil || len(models) == 0 {
+		slog.Warn("Qwen: failed to fetch models, using fallback", "error", err)
+		models = fallbackModels
 	}
 
-	if len(models) > 0 {
-		return models
+	if data, err := json.Marshal(models); err == nil {
+		c.modelCache.Set([]byte("models"), data, modelCacheTTL)
 	}
-
-	return fallbackModels
+	return models
 }
 
 // fetchModelsFromAPI dynamically fetches models from Qwen API

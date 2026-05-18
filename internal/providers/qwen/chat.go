@@ -47,13 +47,11 @@ func (c *Client) chatWithRetry(ctx context.Context, req *providers.ChatRequest, 
 	var err error
 	if req.ChatID != "" {
 		chatID = req.ChatID
-		slog.Debug("Using provided chat ID", "chatID", chatID)
 	} else {
-		chatID, err = c.createChatSession(c.projectID)
+		chatID, err = c.createChatSession("")
 		if err != nil {
 			return nil, fmt.Errorf("failed to create chat session: %w", err)
 		}
-		slog.Debug("Created new chat session", "chatID", chatID)
 	}
 
 	// Build request payload
@@ -91,8 +89,6 @@ func (c *Client) chatWithRetry(ctx context.Context, req *providers.ChatRequest, 
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
-
-	slog.Debug("Qwen completion response", "body_preview", string(body)[:min(len(body), 500)])
 
 	// Parse SSE content
 	content, reasoningContent, toolCalls, parseErrors, responseFID := parseSSEContent(string(body), req.Tools)
@@ -285,13 +281,11 @@ func (c *Client) streamWithRetry(ctx context.Context, req *providers.ChatRequest
 	var err error
 	if req.ChatID != "" {
 		chatID = req.ChatID
-		slog.Debug("Using provided chat ID", "chatID", chatID)
 	} else {
-		chatID, err = c.createChatSession(c.projectID)
+		chatID, err = c.createChatSession("")
 		if err != nil {
 			return nil, fmt.Errorf("failed to create chat session: %w", err)
 		}
-		slog.Debug("Created new chat session", "chatID", chatID)
 	}
 
 	// Create response channel
@@ -368,7 +362,6 @@ func (c *Client) streamWithRetry(ctx context.Context, req *providers.ChatRequest
 		created := time.Now().Unix()
 
 		var contentBuffer strings.Builder
-		var sawToolCallPhase bool
 		var allChunks []string
 		var responseFID string
 
@@ -443,7 +436,6 @@ func (c *Client) streamWithRetry(ctx context.Context, req *providers.ChatRequest
 					allChunks = append(allChunks, contentStr)
 				}
 			case "tool_call":
-				sawToolCallPhase = true
 				contentBuffer.WriteString(contentStr)
 			default:
 				if contentStr != "" {
@@ -469,7 +461,6 @@ func (c *Client) streamWithRetry(ctx context.Context, req *providers.ChatRequest
 		}
 
 		fullText := contentBuffer.String()
-		slog.Debug("Stream end processing", "sawToolCallPhase", sawToolCallPhase, "buffer_len", len(fullText))
 
 		toolCalls, parseErrors := parseToolCallsFromText(fullText, req.Tools)
 
@@ -802,12 +793,11 @@ func (c *Client) createChatSession(projectID string) (string, error) {
 	// Create chat session via Qwen API
 	ts := time.Now().Unix()
 	body := map[string]any{
-		"title":      fmt.Sprintf("api_%d", ts),
-		"models":     []string{},
-		"chat_mode":  "normal",
-		"chat_type":  "t2t",
-		"project_id": projectID,
-		"timestamp":  ts,
+		"title":     fmt.Sprintf("api_%d", ts),
+		"models":    []string{},
+		"chat_mode": "local",
+		"chat_type": "t2t",
+		"timestamp": ts,
 	}
 
 	jsonBody, _ := json.Marshal(body)

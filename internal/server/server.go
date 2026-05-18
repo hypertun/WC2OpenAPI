@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -14,7 +15,9 @@ import (
 	"github.com/user/wc2api/internal/config"
 	"github.com/user/wc2api/internal/handlers"
 	"github.com/user/wc2api/internal/providers"
+	"github.com/user/wc2api/internal/providers/mimo"
 	"github.com/user/wc2api/internal/providers/qwen"
+	"github.com/user/wc2api/internal/providers/qwencn"
 	serverMiddleware "github.com/user/wc2api/internal/server/middleware"
 )
 
@@ -48,6 +51,26 @@ func New(cfg *config.Config) (*Server, error) {
 		}
 	}
 
+	if cfg.Provider.QwenCN.Enabled {
+		prov, err := qwencn.New(cfg.Provider.QwenCN)
+		if err != nil {
+			slog.Error("failed to create qwencn provider", "error", err)
+			errors = append(errors, fmt.Errorf("failed to create qwencn provider: %w", err))
+		} else {
+			s.providers = append(s.providers, prov)
+		}
+	}
+
+	if cfg.Provider.MiMo.Enabled {
+		prov, err := mimo.New(cfg.Provider.MiMo)
+		if err != nil {
+			slog.Error("failed to create mimo provider", "error", err)
+			errors = append(errors, fmt.Errorf("failed to create mimo provider: %w", err))
+		} else {
+			s.providers = append(s.providers, prov)
+		}
+	}
+
 	if len(s.providers) == 0 {
 		if len(errors) > 0 {
 			return nil, fmt.Errorf("no providers available: %v", errors)
@@ -73,20 +96,27 @@ func New(cfg *config.Config) (*Server, error) {
 
 // createRouter creates a function that routes model names to providers
 func (s *Server) createRouter() func(model string) (providers.Provider, bool) {
-	// Build prefix map
-	prefixToProvider := make(map[string]providers.Provider)
+	// Build prefix list, sorted by length descending so more specific prefixes win
+	type prefixEntry struct {
+		prefix string
+		prov   providers.Provider
+	}
+	entries := make([]prefixEntry, 0, len(s.providers))
 	for _, p := range s.providers {
 		name := strings.ToLower(p.Name())
-		prefixToProvider[name] = p
+		entries = append(entries, prefixEntry{prefix: name, prov: p})
 	}
+	sort.Slice(entries, func(i, j int) bool {
+		return len(entries[i].prefix) > len(entries[j].prefix)
+	})
 
 	return func(model string) (providers.Provider, bool) {
 		model = strings.ToLower(model)
 
-		// Check prefixes
-		for prefix, prov := range prefixToProvider {
-			if strings.HasPrefix(model, prefix+"-") || model == prefix {
-				return prov, true
+		// Check prefixes (longest first)
+		for _, e := range entries {
+			if strings.HasPrefix(model, e.prefix+"-") || model == e.prefix {
+				return e.prov, true
 			}
 		}
 

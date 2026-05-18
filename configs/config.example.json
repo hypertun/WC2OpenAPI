@@ -15,8 +15,21 @@
       "password": "your-password",
       "base_url": "https://chat.qwen.ai",
       "timeout": 120,
-      "token_refresh_interval": 1800,
-      "project_id": ""
+      "token_refresh_interval": 1800
+    },
+    "qwencn": {
+      "enabled": false,
+      "ticket": "your-tongyi_sso_ticket",
+      "base_url": "https://chat2.qianwen.com",
+      "timeout": 120
+    },
+    "mimo": {
+      "enabled": false,
+      "service_token": "",
+      "user_id": "",
+      "xiaomichatbot_ph": "",
+      "base_url": "https://aistudio.xiaomimimo.com",
+      "timeout": 120
     }
   }
 }

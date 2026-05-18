@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/coocood/freecache"
 	"github.com/user/wc2api/internal/config"
 )
 
@@ -28,7 +29,6 @@ const (
 // Client handles Qwen webchat interactions with API-based authentication
 type Client struct {
 	config       config.QwenConfig
-	projectID    string
 	httpClient   *http.Client
 	baseURL      *url.URL
 	authToken    string
@@ -36,6 +36,8 @@ type Client struct {
 	lastLogin    time.Time
 	responseIDMu sync.RWMutex
 	responseIDs  map[string]string // chatID → last assistant response message FID
+
+	modelCache *freecache.Cache
 }
 
 // New creates a new Qwen client with API-based authentication
@@ -58,10 +60,10 @@ func New(cfg config.QwenConfig) (*Client, error) {
 
 	client := &Client{
 		config:      cfg,
-		projectID:   cfg.ProjectID,
 		baseURL:     baseURL,
 		httpClient:  httpClient,
 		responseIDs: make(map[string]string),
+		modelCache:  freecache.NewCache(512 * 1024),
 	}
 
 	if err := client.login(); err != nil {

@@ -51,14 +51,11 @@ func (c *Client) login() error {
 	req.ContentLength = int64(len(jsonBody))
 
 	// Execute request (cookiejar will auto-store Set-Cookie)
-	slog.Debug("Sending signin request", "url", c.config.BaseURL+signinURL)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("signin request failed: %w", err)
 	}
 	defer resp.Body.Close()
-
-	slog.Debug("Signin response", "status", resp.StatusCode)
 
 	// Check status code
 	if resp.StatusCode != http.StatusOK {
@@ -95,8 +92,6 @@ func (c *Client) login() error {
 	if len(token) < previewLen {
 		previewLen = len(token)
 	}
-	slog.Debug("Token acquired", "token_preview", token[:previewLen]+"...")
-
 	return nil
 }
 

@@ -29,12 +29,6 @@ func ChatCompletions(selector ProviderSelector) http.HandlerFunc {
 			return
 		}
 
-		slog.Debug("Received chat completion request",
-			"model", req.Model,
-			"stream", req.Stream,
-			"message_count", len(req.Messages),
-		)
-
 		// Validate request
 		if req.Model == "" {
 			writeError(w, http.StatusBadRequest, "Model is required")
@@ -123,7 +117,6 @@ func handleStreaming(w http.ResponseWriter, r *http.Request, provider providers.
 			slog.Error("Failed to marshal chunk", "error", err)
 			continue
 		}
-		slog.Debug("Sending chunk", "data", string(data))
 		fmt.Fprintf(w, "data: %s\n\n", string(data))
 		flusher.Flush()
 	}
