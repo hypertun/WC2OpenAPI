@@ -6,8 +6,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
+	"time"
+
+	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/user/wc2api/internal/providers"
+	middlewarePkg "github.com/user/wc2api/internal/server/middleware"
 )
 
 // ProviderSelector is implemented by the server to route requests to the appropriate provider
@@ -18,18 +23,43 @@ type ProviderSelector interface {
 	ListModels() []providers.Model
 }
 
+// requestMeta holds metadata about a request for logging purposes.
+type requestMeta struct {
+	requestID string
+	startTime time.Time
+	clientIP  string
+	userAgent string
+	apiKey    string
+}
+
 // ChatCompletions returns a handler for chat completions
 func ChatCompletions(selector ProviderSelector) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Parse request
 		var req providers.ChatRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			slog.Error("Failed to decode request", "error", err)
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("Invalid request: %v", err))
 			return
 		}
 
-		// Validate request
+		// Capture request metadata
+		startTime := time.Now()
+		requestID := middleware.GetReqID(r.Context())
+		clientIP := r.Header.Get("X-Forwarded-For")
+		if clientIP == "" {
+			clientIP = strings.Split(r.RemoteAddr, ":")[0]
+		}
+		userAgent := r.UserAgent()
+		apiKey := middlewarePkg.GetAPIKey(r)
+
+		meta := requestMeta{
+			requestID: requestID,
+			startTime: startTime,
+			clientIP:  clientIP,
+			userAgent: userAgent,
+			apiKey:    apiKey,
+		}
+
 		if req.Model == "" {
 			writeError(w, http.StatusBadRequest, "Model is required")
 			return
@@ -48,20 +78,16 @@ func ChatCompletions(selector ProviderSelector) http.HandlerFunc {
 		}
 
 		if req.Stream {
-			// Handle streaming response
-			handleStreaming(w, r, provider, &req)
+			handleStreaming(w, r, provider, &req, meta)
 		} else {
-			// Handle non-streaming response
-			handleNonStreaming(w, r.Context(), provider, &req)
+			handleNonStreaming(w, r.Context(), provider, &req, meta)
 		}
 	}
 }
 
-// handleNonStreaming handles non-streaming chat completions
-func handleNonStreaming(w http.ResponseWriter, ctx context.Context, provider providers.Provider, req *providers.ChatRequest) {
+func handleNonStreaming(w http.ResponseWriter, ctx context.Context, provider providers.Provider, req *providers.ChatRequest, meta requestMeta) {
 	resp, err := provider.CreateChatCompletion(ctx, req)
 	if err != nil {
-		slog.Error("Chat completion failed", "error", err)
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("Completion failed: %v", err))
 		return
 	}
@@ -71,18 +97,14 @@ func handleNonStreaming(w http.ResponseWriter, ctx context.Context, provider pro
 	json.NewEncoder(w).Encode(resp)
 }
 
-// handleStreaming handles streaming chat completions
-func handleStreaming(w http.ResponseWriter, r *http.Request, provider providers.Provider, req *providers.ChatRequest) {
-	// Set SSE headers
+func handleStreaming(w http.ResponseWriter, r *http.Request, provider providers.Provider, req *providers.ChatRequest, meta requestMeta) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no") // Disable nginx buffering
+	w.Header().Set("X-Accel-Buffering", "no")
 
-	// Flush headers
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		slog.Error("Streaming not supported")
 		writeError(w, http.StatusInternalServerError, "Streaming not supported")
 		return
 	}
@@ -90,35 +112,48 @@ func handleStreaming(w http.ResponseWriter, r *http.Request, provider providers.
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	// Create streaming response
 	streamChan, err := provider.CreateChatCompletionStream(r.Context(), req)
 	if err != nil {
-		slog.Error("Stream creation failed", "error", err)
-		// Can't write error response now, so just end the stream
+		slog.Error("stream setup failed", "error", err, "model", req.Model)
 		fmt.Fprintf(w, "data: [DONE]\n\n")
 		flusher.Flush()
 		return
 	}
 
-	// Stream responses
-	for chunk := range streamChan {
-		// Debug: Check the actual type of Arguments in tool calls
-		for _, choice := range chunk.Choices {
-			for _, tc := range choice.Delta.ToolCalls {
-				slog.Debug("Pre-marshal check", 
-					"name", tc.Function.Name,
-					"argsType", fmt.Sprintf("%T", tc.Function.Arguments),
-					"argsValue", tc.Function.Arguments)
+	// Stream responses with keep-alive pings to prevent client timeout during buffering
+	keepAlive := time.NewTicker(15 * time.Second)
+	defer keepAlive.Stop()
+
+	ctx := r.Context()
+	chunkCount := 0
+	totalBytes := 0
+
+loop:
+	for {
+		select {
+		case chunk, ok := <-streamChan:
+			if !ok {
+				break loop
 			}
+
+			data, err := json.Marshal(chunk)
+			if err != nil {
+				continue
+			}
+			chunkCount++
+			totalBytes += len(data)
+			fmt.Fprintf(w, "data: %s\n\n", string(data))
+			flusher.Flush()
+
+		case <-keepAlive.C:
+			// Send keep-alive comment to prevent client timeout during long buffering phases
+			fmt.Fprintf(w, ": keep-alive\n\n")
+			flusher.Flush()
+
+		case <-ctx.Done():
+			// Client cancelled or context deadline exceeded — stop streaming
+			return
 		}
-		
-		data, err := json.Marshal(chunk)
-		if err != nil {
-			slog.Error("Failed to marshal chunk", "error", err)
-			continue
-		}
-		fmt.Fprintf(w, "data: %s\n\n", string(data))
-		flusher.Flush()
 	}
 
 	// Send done signal

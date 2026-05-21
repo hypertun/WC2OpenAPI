@@ -3,7 +3,7 @@
     "host": "0.0.0.0",
     "port": "5001",
     "read_timeout": 30,
-    "write_timeout": 120
+    "write_timeout": 600
   },
   "auth": {
     "api_keys": []
@@ -15,21 +15,32 @@
       "password": "your-password",
       "base_url": "https://chat.qwen.ai",
       "timeout": 120,
-      "token_refresh_interval": 1800
+      "token_refresh_interval": 1800,
+      "max_query_chars": 80000
     },
     "qwencn": {
       "enabled": false,
       "ticket": "your-tongyi_sso_ticket",
       "base_url": "https://chat2.qianwen.com",
-      "timeout": 120
+      "timeout": 120,
+      "max_query_chars": 80000
     },
-    "mimo": {
-      "enabled": false,
-      "service_token": "",
-      "user_id": "",
-      "xiaomichatbot_ph": "",
-      "base_url": "https://aistudio.xiaomimimo.com",
-      "timeout": 120
-    }
-  }
+     "mimo": {
+       "enabled": false,
+       "service_token": "",
+       "user_id": "",
+       "xiaomichatbot_ph": "",
+       "base_url": "https://aistudio.xiaomimimo.com",
+       "timeout": 120,
+       "max_query_chars": 80000
+     },
+      "stepfun": {
+        "enabled": false,
+        "oasis_token": "your-oasis-token-jwt",
+        "oasis_webid": "your-oasis-webid",
+        "base_url": "https://www.stepfun.com",
+        "timeout": 120,
+        "max_query_chars": 80000
+      }
+   }
 }

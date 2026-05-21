@@ -158,38 +158,13 @@ func makeTool(name, desc string, props map[string]interface{}, req []interface{}
 	}
 }
 
-func TestBuildToolCallInstructions(t *testing.T) {
-	tools := []providers.Tool{
-		makeTool("bash", "run a shell command",
-			map[string]interface{}{"command": map[string]interface{}{"type": "string"}},
-			[]interface{}{"command"}),
-	}
-	instructions := BuildToolCallInstructions(tools)
-
-	if instructions == "" {
-		t.Error("expected non-empty instructions")
-	}
-	if !contains(instructions, "<|DSML|tool_calls|>") {
-		t.Error("expected DSML tool_calls tag in instructions")
-	}
-	if !contains(instructions, "bash") {
-		t.Error("expected tool name in instructions")
-	}
-	if !contains(instructions, "command") {
-		t.Error("expected parameter name in instructions")
-	}
-	if !contains(instructions, "string") {
-		t.Error("expected parameter type in instructions")
-	}
-}
-
-func TestBuildQwenToolCallInstructions(t *testing.T) {
+func TestBuildMarkerPrompt(t *testing.T) {
 	tools := []providers.Tool{
 		makeTool("Read", "read a file",
 			map[string]interface{}{"file_path": map[string]interface{}{"type": "string"}},
 			[]interface{}{"file_path"}),
 	}
-	instructions := BuildQwenToolCallInstructions(tools)
+	instructions := BuildMarkerPrompt(tools, false)
 
 	if instructions == "" {
 		t.Error("expected non-empty instructions")
@@ -209,17 +184,22 @@ func TestBuildQwenToolCallInstructions(t *testing.T) {
 	if !strings.Contains(instructions, "VALIDATION CHECKLIST") {
 		t.Errorf("expected VALIDATION CHECKLIST in instructions, got:\n%s", instructions)
 	}
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsString(s, substr))
-}
-
-func containsString(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
+	if strings.Contains(instructions, "you may also output XML") {
+		t.Error("expected no flexibility note when includeFlexibilityNote=false")
 	}
-	return false
 }
+
+func TestBuildMarkerPrompt_WithFlexibilityNote(t *testing.T) {
+	tools := []providers.Tool{
+		makeTool("Read", "read a file",
+			map[string]interface{}{"file_path": map[string]interface{}{"type": "string"}},
+			[]interface{}{"file_path"}),
+	}
+	instructions := BuildMarkerPrompt(tools, true)
+
+	if !strings.Contains(instructions, "you may also output XML") {
+		t.Error("expected flexibility note when includeFlexibilityNote=true")
+	}
+}
+
+

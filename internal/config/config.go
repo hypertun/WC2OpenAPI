@@ -8,9 +8,9 @@ import (
 
 // Config represents the application configuration
 type Config struct {
-	Server   ServerConfig   `json:"server"`
-	Auth     AuthConfig     `json:"auth"`
-	Provider ProviderConfig `json:"provider"`
+	Server       ServerConfig   `json:"server"`
+	Auth         AuthConfig     `json:"auth"`
+	Provider     ProviderConfig `json:"provider"`
 }
 
 // ServerConfig holds HTTP server settings
@@ -29,9 +29,10 @@ type AuthConfig struct {
 
 // ProviderConfig holds provider-specific settings
 type ProviderConfig struct {
-	Qwen   QwenConfig   `json:"qwen"`
-	QwenCN QwenCNConfig `json:"qwencn"`
-	MiMo   MiMoConfig   `json:"mimo"`
+	Qwen    QwenConfig    `json:"qwen"`
+	QwenCN  QwenCNConfig  `json:"qwencn"`
+	MiMo    MiMoConfig    `json:"mimo"`
+	StepFun StepFunConfig `json:"stepfun"`
 }
 
 // QwenConfig holds Qwen provider settings
@@ -42,14 +43,16 @@ type QwenConfig struct {
 	BaseURL              string `json:"base_url"`
 	Timeout              int    `json:"timeout"`                // seconds
 	TokenRefreshInterval int    `json:"token_refresh_interval"` // seconds
+	MaxQueryChars        int    `json:"max_query_chars"`        // auto-split when query exceeds this (0 = default 12000)
 }
 
 // QwenCNConfig holds Qwen CN (qianwen.com) provider settings
 type QwenCNConfig struct {
-	Enabled  bool   `json:"enabled"`
-	Ticket   string `json:"ticket"`              // tongyi_sso_ticket from browser
-	BaseURL  string `json:"base_url"`            // https://chat2.qianwen.com
-	Timeout  int    `json:"timeout"`             // seconds
+	Enabled       bool   `json:"enabled"`
+	Ticket        string `json:"ticket"`              // tongyi_sso_ticket from browser
+	BaseURL       string `json:"base_url"`            // https://chat2.qianwen.com
+	Timeout       int    `json:"timeout"`             // seconds
+	MaxQueryChars int    `json:"max_query_chars"`     // auto-split when query exceeds this (0 = default 12000)
 }
 
 // MiMoConfig holds Xiaomi MiMo AI Studio provider settings
@@ -60,6 +63,17 @@ type MiMoConfig struct {
 	XiaomiChatbotPH string `json:"xiaomichatbot_ph"`  // xiaomichatbot_ph cookie
 	BaseURL         string `json:"base_url"`          // https://aistudio.xiaomimimo.com
 	Timeout         int    `json:"timeout"`           // seconds
+	MaxQueryChars   int    `json:"max_query_chars"`   // auto-split when query exceeds this (0 = default 12000)
+}
+
+// StepFunConfig holds StepFun (stepfun.com) provider settings
+type StepFunConfig struct {
+	Enabled       bool   `json:"enabled"`
+	OasisToken    string `json:"oasis_token"`     // Oasis-Token cookie (JWT access token, required)
+	OasisWebid    string `json:"oasis_webid"`     // Oasis-Webid cookie (device/session ID, required)
+	BaseURL       string `json:"base_url"`         // https://www.stepfun.com
+	Timeout       int    `json:"timeout"`          // seconds
+	MaxQueryChars int    `json:"max_query_chars"`  // auto-split when query exceeds this (0 = default 12000)
 }
 
 // DefaultConfig returns a configuration with sensible defaults
@@ -86,9 +100,14 @@ func DefaultConfig() *Config {
 				BaseURL: "https://chat2.qianwen.com",
 				Timeout: 120,
 			},
-			MiMo: MiMoConfig{
+ 		MiMo: MiMoConfig{
 				Enabled: false,
 				BaseURL: "https://aistudio.xiaomimimo.com",
+				Timeout: 120,
+			},
+			StepFun: StepFunConfig{
+				Enabled: false,
+				BaseURL: "https://www.stepfun.com",
 				Timeout: 120,
 			},
 		},
@@ -138,10 +157,18 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("qwencn ticket is required when qwencn is enabled")
 		}
 	}
-	if c.Provider.MiMo.Enabled {
-		if c.Provider.MiMo.ServiceToken == "" {
-			return fmt.Errorf("mimo service_token is required when mimo is enabled")
-		}
-	}
-	return nil
+ 	if c.Provider.MiMo.Enabled {
+ 		if c.Provider.MiMo.ServiceToken == "" {
+ 			return fmt.Errorf("mimo service_token is required when mimo is enabled")
+ 		}
+ 	}
+ 	if c.Provider.StepFun.Enabled {
+ 		if c.Provider.StepFun.OasisToken == "" {
+ 			return fmt.Errorf("stepfun oasis_token is required when stepfun is enabled")
+ 		}
+ 		if c.Provider.StepFun.OasisWebid == "" {
+ 			return fmt.Errorf("stepfun oasis_webid is required when stepfun is enabled")
+ 		}
+ 	}
+ 	return nil
 }

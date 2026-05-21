@@ -3,11 +3,15 @@ package mimo
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	providers "github.com/user/wc2api/internal/providers"
+	"github.com/user/wc2api/internal/toolcall"
 )
+
+const defaultMaxQueryChars = 12000
 
 const (
 	thinkOpen  = "<think>"
@@ -17,6 +21,44 @@ const (
 // CreateChatCompletion creates a non-streaming chat completion.
 // Buffers all SSE events and returns a single response.
 func (c *Client) CreateChatCompletion(ctx context.Context, req *providers.ChatRequest) (*providers.ChatResponse, error) {
+	return c.chatWithRetry(ctx, req, 0)
+}
+
+// maxQueryChars returns the configured max query character limit, or the default.
+func (c *Client) maxQueryChars() int {
+	if c.config.MaxQueryChars > 0 {
+		return c.config.MaxQueryChars
+	}
+	return defaultMaxQueryChars
+}
+
+// chatWithRetry sends a chat completion request with automatic retry on
+// tool-call validation errors and transparent splitting when the query is too long.
+func (c *Client) chatWithRetry(ctx context.Context, req *providers.ChatRequest, retryCount int) (*providers.ChatResponse, error) {
+	// Pre-check: if message size exceeds limit, split proactively
+	toolPromptSize := providers.EstimateToolPromptSize(req.Tools)
+	querySize := providers.EstimateQuerySize(req.Messages) + toolPromptSize
+	if querySize > c.maxQueryChars() {
+		slog.Info("MiMo: proactively splitting long message",
+			"query_size", querySize,
+			"max_chars", c.maxQueryChars(),
+		)
+		return providers.SplitAndSend(ctx, c.sendDirect, req, c.maxQueryChars(), providers.StandardEstimate)
+	}
+
+	return c.sendDirect(ctx, req, retryCount)
+}
+
+// sendDirect performs a single chat completion without the size-check guard.
+// This is the raw send path used by SplitAndSend to avoid infinite recursion:
+// chatWithRetry → SplitAndSend → sendDirect (stops here, no re-check).
+// It still handles tool-call validation errors with retry.
+func (c *Client) sendDirect(ctx context.Context, req *providers.ChatRequest, retryCount int) (*providers.ChatResponse, error) {
+	// Inject tools into messages before formatting
+	if len(req.Tools) > 0 {
+		req.Messages = c.toolEngine.InjectTools(req.Messages, req.Tools, req.ToolChoice)
+	}
+
 	query, thinking := buildQuery(req)
 	model := req.Model
 
@@ -49,16 +91,51 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req *providers.ChatRe
 
 	fullContent := contentBuf.String()
 	fullContent = strings.ReplaceAll(fullContent, "\x00", "")
+
+	// Detect "too long" error as a fallback (shouldn't happen with proactive check, but safety net)
+	if providers.IsTooLongError(fullContent) {
+		slog.Warn("MiMo: received 'too long' error despite proactive splitting check")
+		return nil, fmt.Errorf("mimo: query too long and cannot be split further")
+	}
+
 	content, thinkingContent := splitThinkTags(fullContent)
 
 	// Extract tool calls if tools were provided
 	var toolCalls []providers.ToolCall
 	if len(req.Tools) > 0 {
-		toolNames := getToolNames(req.Tools)
-		tc, cleaned := extractToolCall(content, toolNames)
-		if tc != nil {
+		// Parse fullContent first (includes <think> blocks) to catch tool calls in thinking
+		tc, cleaned, _ := c.toolEngine.Parse(fullContent, req.Tools)
+		if len(tc) > 0 {
 			toolCalls = tc
-			content = cleaned
+			// Re-derive display text by re-splitting the cleaned output
+			content, thinkingContent = splitThinkTags(cleaned)
+		}
+
+		// Validate tool calls and retry if needed
+		validationErrors := c.toolEngine.Validate(toolCalls, req.Tools)
+		if c.toolEngine.ShouldRetry(validationErrors, retryCount) {
+			for _, ve := range validationErrors {
+				slog.Debug("MiMo: validation error detail",
+					"tool", ve.ToolName,
+					"param", ve.Parameter,
+					"severity", ve.Severity,
+					"message", ve.Message,
+					"expected", ve.Expected,
+					"actual", fmt.Sprintf("%v", ve.Actual),
+				)
+			}
+			feedback := c.toolEngine.GenerateErrorFeedback(validationErrors)
+			backoff := c.toolEngine.CalculateBackoff(retryCount)
+
+			slog.Info("MiMo: retrying chat completion with error feedback",
+				"retry", retryCount+1,
+				"errors", len(validationErrors),
+				"backoff_ms", backoff.Milliseconds(),
+			)
+
+			time.Sleep(backoff)
+			retryReq := c.toolEngine.BuildRetryRequest(req, feedback)
+			return c.sendDirect(ctx, retryReq, retryCount+1)
 		}
 	}
 
@@ -98,6 +175,27 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req *providers.ChatRe
 // CreateChatCompletionStream creates a streaming chat completion.
 // Pipes SSE events from MiMo through to the OpenAI streaming format.
 func (c *Client) CreateChatCompletionStream(ctx context.Context, req *providers.ChatRequest) (<-chan providers.StreamResponse, error) {
+	return c.streamWithRetry(ctx, req, 0)
+}
+
+func (c *Client) streamWithRetry(ctx context.Context, req *providers.ChatRequest, retryCount int) (<-chan providers.StreamResponse, error) {
+	// Pre-check: if message size exceeds limit, split proactively and convert to stream
+	toolPromptSize := providers.EstimateToolPromptSize(req.Tools)
+	querySize := providers.EstimateQuerySize(req.Messages) + toolPromptSize
+	if querySize > c.maxQueryChars() {
+		slog.Info("MiMo: proactively splitting long message (streaming)",
+			"query_size", querySize,
+			"max_chars", c.maxQueryChars(),
+		)
+		// Convert non-streaming split response to stream
+		return convertToStream(ctx, c, req)
+	}
+
+	// Inject tools into messages before formatting
+	if len(req.Tools) > 0 {
+		req.Messages = c.toolEngine.InjectTools(req.Messages, req.Tools, req.ToolChoice)
+	}
+
 	query, thinking := buildQuery(req)
 	model := req.Model
 
@@ -114,252 +212,97 @@ func (c *Client) CreateChatCompletionStream(ctx context.Context, req *providers.
 
 		msgID := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 		created := time.Now().Unix()
-		hasTools := len(req.Tools) > 0
-		var toolNames []string
-		if hasTools {
-			toolNames = getToolNames(req.Tools)
+
+		// Create adapter for real-time streaming.
+		adapter := toolcall.NewStreamSieveAdapter(c.toolEngine, req.Tools, msgID, req.Model, created)
+		if len(req.Tools) > 0 {
+			adapter.WithRetry(ctx, func(ctx2 context.Context, req2 *providers.ChatRequest, rc int) (<-chan providers.StreamResponse, error) {
+				return c.streamWithRetry(ctx2, req2, rc)
+			}, req, retryCount)
 		}
 
-		// Send initial role delta
-		outChan <- providers.StreamResponse{
-			ID:      msgID,
-			Object:  "chat.completion.chunk",
-			Created: created,
-			Model:   model,
-			Choices: []providers.StreamChoice{{
-				Index: 0,
-				Delta: providers.Delta{Role: "assistant"},
-			}},
-		}
-
-		var buffer strings.Builder
+		// Think-tag state machine for MiMo's <think>...</think> blocks.
 		inThink := false
-		var contentBuilder strings.Builder
-		var collectedToolCalls []providers.ToolCall
+		var thinkBuf strings.Builder
+
+		feedChunk := func(chunk string) {
+			if chunk == "" {
+				return
+			}
+			for {
+				if inThink {
+					idx := strings.Index(chunk, thinkClose)
+					if idx >= 0 {
+						thinkContent := chunk[:idx]
+						if strings.TrimSpace(thinkContent) != "" {
+							for _, c := range adapter.FeedThinking(thinkContent) {
+								outChan <- c
+							}
+						}
+						chunk = chunk[idx+len(thinkClose):]
+						inThink = false
+						continue
+					}
+					// No closing tag yet — buffer the think content.
+					thinkBuf.WriteString(chunk)
+					return
+				}
+
+				idx := strings.Index(chunk, thinkOpen)
+				if idx >= 0 {
+					// Emit content before think tag.
+					before := chunk[:idx]
+					if strings.TrimSpace(before) != "" {
+						for _, c := range adapter.FeedText(before) {
+							outChan <- c
+						}
+					}
+					chunk = chunk[idx+len(thinkOpen):]
+					inThink = true
+					continue
+				}
+
+				// No think tags — emit remaining as content.
+				if strings.TrimSpace(chunk) != "" {
+					for _, c := range adapter.FeedText(chunk) {
+						outChan <- c
+					}
+				}
+				return
+			}
+		}
 
 		for event := range eventChan {
 			switch event.Type {
 			case "text":
 				chunk := strings.ReplaceAll(event.Content, "\x00", "")
-				contentBuilder.WriteString(chunk)
-				buffer.WriteString(chunk)
+				feedChunk(chunk)
 			default:
 				// usage events are ignored for streaming
 			}
-
-			processBuffer(&buffer, &inThink, msgID, model, created, hasTools, outChan)
 		}
 
-		// If tools were provided, extract tool calls from full response
-		if hasTools {
-			fullContent := contentBuilder.String()
-			tc, cleaned := extractToolCall(fullContent, toolNames)
-			if tc != nil {
-				collectedToolCalls = tc
-				// Emit reasoning + content before tool calls
-				c, reasoning := splitThinkTags(cleaned)
-				if reasoning != "" {
-					outChan <- providers.StreamResponse{
-						ID: msgID, Object: "chat.completion.chunk", Created: created, Model: model,
-						Choices: []providers.StreamChoice{{Index: 0, Delta: providers.Delta{ReasoningContent: reasoning}}},
-					}
-				}
-				if c != "" {
-					outChan <- providers.StreamResponse{
-						ID: msgID, Object: "chat.completion.chunk", Created: created, Model: model,
-						Choices: []providers.StreamChoice{{Index: 0, Delta: providers.Delta{Content: c}}},
-					}
-				}
-			} else {
-				// No tool calls found — stream the content with think/reasoning split
-				content, reasoning := splitThinkTags(cleaned)
-				if reasoning != "" {
-					outChan <- providers.StreamResponse{
-						ID: msgID, Object: "chat.completion.chunk", Created: created, Model: model,
-						Choices: []providers.StreamChoice{{Index: 0, Delta: providers.Delta{ReasoningContent: reasoning}}},
-					}
-				}
-				if content != "" {
-					outChan <- providers.StreamResponse{
-						ID: msgID, Object: "chat.completion.chunk", Created: created, Model: model,
-						Choices: []providers.StreamChoice{{Index: 0, Delta: providers.Delta{Content: content}}},
-					}
-				}
-			}
-		} else {
-			// No tools — stream remaining buffer directly
-			buf := buffer.String()
-			if buf != "" {
-				content, reasoning := splitThinkTags(buf)
-				if reasoning != "" {
-					outChan <- providers.StreamResponse{
-						ID: msgID, Object: "chat.completion.chunk", Created: created, Model: model,
-						Choices: []providers.StreamChoice{{Index: 0, Delta: providers.Delta{ReasoningContent: reasoning}}},
-					}
-				}
-				if content != "" {
-					outChan <- providers.StreamResponse{
-						ID: msgID, Object: "chat.completion.chunk", Created: created, Model: model,
-						Choices: []providers.StreamChoice{{Index: 0, Delta: providers.Delta{Content: content}}},
-					}
-				}
+		// If we were mid-think tag, flush the buffered thinking content.
+		if inThink && thinkBuf.Len() > 0 {
+			for _, c := range adapter.FeedThinking(thinkBuf.String()) {
+				outChan <- c
 			}
 		}
 
-		// Send final chunk
-		finishReason := "stop"
-		if len(collectedToolCalls) > 0 {
-			finishReason = "tool_calls"
-			outChan <- providers.StreamResponse{
-				ID: msgID, Object: "chat.completion.chunk", Created: created, Model: model,
-				Choices: []providers.StreamChoice{{
-					Index: 0,
-					Delta: providers.Delta{ToolCalls: collectedToolCalls},
-				}},
-			}
-		}
-
-		outChan <- providers.StreamResponse{
-			ID: msgID, Object: "chat.completion.chunk", Created: created, Model: model,
-			Choices: []providers.StreamChoice{{
-				Index:        0,
-				Delta:        providers.Delta{},
-				FinishReason: &finishReason,
-			}},
+		// Flush adapter: handles parsing, validation, optional retry, and final chunks.
+		for _, chunk := range adapter.Flush() {
+			outChan <- chunk
 		}
 	}()
 
 	return outChan, nil
 }
 
-// processBuffer handles think tag splitting and streaming output.
-// When tools are active, content is buffered for tool call detection at the end.
-func processBuffer(
-	buffer *strings.Builder,
-	inThink *bool,
-	msgID, model string,
-	created int64,
-	hasTools bool,
-	outChan chan<- providers.StreamResponse,
-) {
-	buf := buffer.String()
-	if buf == "" {
-		return
-	}
-
-	if hasTools {
-		return
-	}
-
-	// Without tools, stream content with think tag splitting
-	buffer.Reset()
-
-	for {
-		if *inThink {
-			idx := strings.Index(buf, thinkClose)
-			if idx >= 0 {
-				thinkContent := buf[:idx]
-				if strings.TrimSpace(thinkContent) != "" {
-					outChan <- providers.StreamResponse{
-						ID: msgID, Object: "chat.completion.chunk", Created: created, Model: model,
-						Choices: []providers.StreamChoice{{Index: 0, Delta: providers.Delta{ReasoningContent: thinkContent}}},
-					}
-				}
-				buf = buf[idx+len(thinkClose):]
-				*inThink = false
-				continue
-			}
-			// No closing tag yet — hold the buffer
-			buffer.WriteString(buf)
-			return
-		}
-
-		idx := strings.Index(buf, thinkOpen)
-		if idx >= 0 {
-			// Emit content before think tag
-			before := buf[:idx]
-			if strings.TrimSpace(before) != "" {
-				outChan <- providers.StreamResponse{
-					ID: msgID, Object: "chat.completion.chunk", Created: created, Model: model,
-					Choices: []providers.StreamChoice{{Index: 0, Delta: providers.Delta{Content: before}}},
-				}
-			}
-			buf = buf[idx+len(thinkOpen):]
-			*inThink = true
-			continue
-		}
-
-		// No think tag — emit remaining content
-		if strings.TrimSpace(buf) != "" {
-			outChan <- providers.StreamResponse{
-				ID: msgID, Object: "chat.completion.chunk", Created: created, Model: model,
-				Choices: []providers.StreamChoice{{Index: 0, Delta: providers.Delta{Content: buf}}},
-			}
-		}
-		return
-	}
-}
-
 // buildQuery constructs the MiMo query string from the chat request.
 // Messages are concatenated with role prefixes (system:/user:/assistant:/tool:).
-// Tool definitions are injected into the system message.
+// This delegates to the shared BuildFlatQuery function.
 func buildQuery(req *providers.ChatRequest) (query string, thinking bool) {
-	thinking = false
-	var parts []string
-	var systemText string
-
-	for _, msg := range req.Messages {
-		content := string(msg.Content)
-
-		switch msg.Role {
-		case "system":
-			systemText = content
-			continue
-		case "user":
-			parts = append(parts, "user: "+content)
-		case "assistant":
-			if len(msg.ToolCalls) > 0 {
-				var tcLines []string
-				for _, tc := range msg.ToolCalls {
-					tcLines = append(tcLines, fmt.Sprintf("TOOL_CALL: %s(%s)", tc.Function.Name, tc.Function.Arguments))
-				}
-				if content != "" {
-					parts = append(parts, "assistant: "+content+"\n"+strings.Join(tcLines, "\n"))
-				} else {
-					parts = append(parts, "assistant: "+strings.Join(tcLines, "\n"))
-				}
-			} else {
-				parts = append(parts, "assistant: "+content)
-			}
-		case "tool":
-			clean := strings.TrimPrefix(content, "[TOOL_RESULT]")
-			parts = append(parts, "user: [tool_result id="+msg.ToolCallID+"] "+clean)
-		}
-	}
-
-	// Inject tool definitions into system prompt
-	if len(req.Tools) > 0 {
-		toolPrompt := buildToolPrompt(req.Tools)
-		if toolPrompt != "" {
-			if systemText != "" {
-				systemText = systemText + "\n\n" + toolPrompt
-			} else {
-				systemText = toolPrompt
-			}
-		}
-	}
-
-	// Prepend system message if present
-	if systemText != "" {
-		parts = append([]string{"system: " + systemText}, parts...)
-	}
-
-	query = strings.Join(parts, "\n")
-	if query == "" {
-		query = "Hello"
-	}
-
-	return query, thinking
+	return providers.BuildFlatQuery(req.Messages), false
 }
 
 // splitThinkTags extracts <think>...</think> blocks from the response.
@@ -377,4 +320,28 @@ func splitThinkTags(text string) (content, thinkingContent string) {
 	thinkingContent = text[start+len(thinkOpen) : end]
 	content = text[:start] + text[end+len(thinkClose):]
 	return content, thinkingContent
+}
+
+
+
+// convertToStream converts a non-streaming split response to a streaming response channel.
+func convertToStream(ctx context.Context, c *Client, req *providers.ChatRequest) (<-chan providers.StreamResponse, error) {
+	outChan := make(chan providers.StreamResponse, 10)
+
+	go func() {
+		defer close(outChan)
+
+		resp, err := providers.SplitAndSend(ctx, c.sendDirect, req, c.maxQueryChars(), providers.StandardEstimate)
+		if err != nil {
+			slog.Error("MiMo: split failed", "error", err)
+			return
+		}
+
+		// Delegate to the shared stream conversion function
+		for chunk := range providers.EmitCompletionAsStream(ctx, resp, req.Model) {
+			outChan <- chunk
+		}
+	}()
+
+	return outChan, nil
 }

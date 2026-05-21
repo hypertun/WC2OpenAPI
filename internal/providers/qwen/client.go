@@ -16,6 +16,7 @@ import (
 
 	"github.com/coocood/freecache"
 	"github.com/user/wc2api/internal/config"
+	"github.com/user/wc2api/internal/toolcall"
 )
 
 const (
@@ -38,6 +39,7 @@ type Client struct {
 	responseIDs  map[string]string // chatID → last assistant response message FID
 
 	modelCache *freecache.Cache
+	toolEngine *toolcall.ToolCallEngine
 }
 
 // New creates a new Qwen client with API-based authentication
@@ -64,6 +66,7 @@ func New(cfg config.QwenConfig) (*Client, error) {
 		httpClient:  httpClient,
 		responseIDs: make(map[string]string),
 		modelCache:  freecache.NewCache(512 * 1024),
+		toolEngine:  toolcall.New(toolcall.QwenCompactConfig()),
 	}
 
 	if err := client.login(); err != nil {

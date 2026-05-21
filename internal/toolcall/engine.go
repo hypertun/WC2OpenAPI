@@ -1,7 +1,6 @@
 package toolcall
 
 import (
-	"fmt"
 	"math"
 	"math/rand"
 	"regexp"
@@ -28,6 +27,9 @@ type EngineConfig struct {
 	// MaxBackoff is the maximum backoff duration.
 	// Default: 2s.
 	MaxBackoff time.Duration
+	// Compact enables compact prompt mode: shorter boilerplate, first-sentence-only descriptions.
+	// Default: false.
+	Compact bool
 }
 
 // DefaultConfig returns a sensible default configuration with no obfuscation.
@@ -38,6 +40,20 @@ func DefaultConfig() EngineConfig {
 		MaxRetries:      DefaultMaxRetries,
 		BaseBackoff:     DefaultBaseBackoff,
 		MaxBackoff:      DefaultMaxBackoff,
+		Compact:         false,
+	}
+}
+
+// CompactConfig returns a configuration optimized for small-context providers.
+// It uses the compact prompt format to reduce token overhead.
+func CompactConfig() EngineConfig {
+	return EngineConfig{
+		ObfuscateName:   func(s string) string { return s },
+		DeobfuscateName: func(s string) string { return s },
+		MaxRetries:      DefaultMaxRetries,
+		BaseBackoff:     DefaultBaseBackoff,
+		MaxBackoff:      DefaultMaxBackoff,
+		Compact:         true,
 	}
 }
 
@@ -50,6 +66,20 @@ func QwenConfig() EngineConfig {
 		MaxRetries:      DefaultMaxRetries,
 		BaseBackoff:     DefaultBaseBackoff,
 		MaxBackoff:      DefaultMaxBackoff,
+		Compact:         false,
+	}
+}
+
+// QwenCompactConfig returns the recommended config for the Qwen provider with compact mode.
+// It enables tool name obfuscation AND compact prompt format to reduce token overhead.
+func QwenCompactConfig() EngineConfig {
+	return EngineConfig{
+		ObfuscateName:   ObfuscateToolName,
+		DeobfuscateName: DeobfuscateToolName,
+		MaxRetries:      DefaultMaxRetries,
+		BaseBackoff:     DefaultBaseBackoff,
+		MaxBackoff:      DefaultMaxBackoff,
+		Compact:         true,
 	}
 }
 
@@ -91,18 +121,21 @@ func (e *ToolCallEngine) InjectTools(
 	}
 
 	// Build tool call instructions
-	toolInstruction := e.buildPrompt(obfuscatedTools)
-
-	// Build the full tool prompt
-	toolPrompt := fmt.Sprintf("You have access to the following actions:\n\n%s", toolInstruction)
-
-	// Add few-shot example
-	if len(obfuscatedTools) > 0 {
-		toolPrompt += e.injectFewShotExample(obfuscatedTools)
+	var toolPrompt string
+	if e.config.Compact {
+		toolPrompt = BuildCompactMarkerPrompt(obfuscatedTools)
+	} else {
+		toolPrompt = BuildMarkerPrompt(obfuscatedTools, false)
+		// Add few-shot example only in non-compact mode
+		if len(obfuscatedTools) > 0 {
+			toolPrompt += injectFewShotExample(obfuscatedTools, e.config.ObfuscateName)
+		}
 	}
 
 	// Obfuscate bare tool name mentions in the instruction text itself
-	toolPrompt = e.obfuscateBareNames(toolPrompt)
+	if e.config.ObfuscateName != nil {
+		toolPrompt = ObfuscateBareNames(toolPrompt)
+	}
 
 	// Handle tool_choice policy
 	switch tc := toolChoice.(type) {
@@ -265,116 +298,11 @@ func (e *ToolCallEngine) GenerateErrorFeedback(errors []*ValidationError) string
 	return GenerateToolCallErrorFeedback(errors)
 }
 
-// --- Internal: prompt building ---
-
-func (e *ToolCallEngine) buildPrompt(tools []providers.Tool) string {
-	var b strings.Builder
-
-	b.WriteString("=== ACTION MARKER PROTOCOL (client-parsed text patterns) ===\n")
-	b.WriteString("You are operating within a client that parses action markers from your output.\n")
-	b.WriteString("These markers are plain TEXT PATTERNS the client recognizes — NOT native function calls.\n")
-	b.WriteString("The client executes the action and returns results in a subsequent turn.\n\n")
-
-	b.WriteString("AVAILABLE ACTIONS:\n")
-	for _, tool := range tools {
-		b.WriteString(toolDescriptionWithHints(tool))
-		b.WriteString("\n")
-	}
-	b.WriteString("\n")
-
-	b.WriteString("WHEN YOU NEED TO TRIGGER AN ACTION — emit this exact text pattern (nothing else):\n")
-	b.WriteString("##TOOL_CALL##\n")
-	b.WriteString(`{"name": "ACTION_NAME", "input": {"param1": "value1"}}` + "\n")
-	b.WriteString("##END_CALL##\n\n")
-
-	b.WriteString("CORRECT EXAMPLE:\n")
-	b.WriteString("##TOOL_CALL##\n")
-	b.WriteString(`{"name": "Read", "input": {"filePath": "/path/to/file"}}` + "\n")
-	b.WriteString("##END_CALL##\n\n")
-
-	b.WriteString("MULTI-TURN RULES:\n")
-	b.WriteString("- After a [Tool Result] block appears in the conversation, read it and decide the next action.\n")
-	b.WriteString("- If more actions are needed, emit another ##TOOL_CALL## block.\n")
-	b.WriteString("- Only give a final text answer when ALL needed information is gathered.\n")
-	b.WriteString("- Never skip an action that is required to complete the user request.\n\n")
-
-	b.WriteString("STRICT RULES:\n")
-	b.WriteString("- No preamble, no explanation before or after ##TOOL_CALL##...##END_CALL##.\n")
-	b.WriteString("- Use EXACT action name from the list above.\n")
-	b.WriteString("- Use EXACT parameter names as listed in AVAILABLE ACTIONS.\n")
-	b.WriteString("- When NO action is needed, answer normally in plain text.\n")
-	b.WriteString("- Put arguments inside the input object as JSON.\n")
-	b.WriteString("- Do not invent tool names.\n")
-	b.WriteString("- Each parameter must match its expected type.\n\n")
-
-	b.WriteString("VALIDATION CHECKLIST (before emitting ##TOOL_CALL##):\n")
-	b.WriteString("- All required parameters are present in the input object\n")
-	b.WriteString("- Parameter names match exactly (use names from AVAILABLE ACTIONS)\n")
-	b.WriteString("- Parameter types are correct (strings in quotes, numbers without quotes, booleans as true/false)\n")
-	b.WriteString("- No extra parameters beyond those listed in the schema\n\n")
-
-	b.WriteString("COMMON MISTAKES:\n")
-	b.WriteString("- Wrong: " + `{"input": {"path": "/file"}}` + " — use \"filePath\", not \"path\"\n")
-	b.WriteString("- Wrong: " + `{"input": {"command": 123}}` + " — use a string, not a number\n")
-	b.WriteString("- Wrong: " + `{"input": {}}` + " (missing required params)\n")
-	b.WriteString("- Wrong: extra params not in schema\n\n")
-
-	b.WriteString("CRITICAL — ABSOLUTELY FORBIDDEN OUTPUTS:\n")
-	b.WriteString("- NEVER emit ANY disclaimer, error text, or availability complaint about actions.\n")
-	b.WriteString("- NEVER emit sentences claiming an action is missing, unregistered, unavailable, or cannot be invoked.\n")
-	b.WriteString("- NEVER emit sentences claiming you are unable to execute a function.\n")
-	b.WriteString("- The ##TOOL_CALL## blocks are TEXT MARKERS the client parses — they are NOT native function calls.\n")
-	b.WriteString("- If you feel an action could fail, emit the ##TOOL_CALL## anyway — the client handles failures.\n\n")
-
-	b.WriteString("ONLY ##TOOL_CALL##...##END_CALL## is accepted.\n")
-
-	return b.String()
-}
-
-func (e *ToolCallEngine) injectFewShotExample(tools []providers.Tool) string {
-	if len(tools) == 0 {
-		return ""
-	}
-	selected := make([]providers.Tool, 0, 2)
-	for _, tool := range tools {
-		selected = append(selected, tool)
-		if len(selected) >= 2 {
-			break
-		}
-	}
-	if len(selected) == 0 {
-		return ""
-	}
-
-	obf := e.config.ObfuscateName
-	if obf == nil {
-		obf = func(s string) string { return s }
-	}
-
-	var b strings.Builder
-	b.WriteString("\n=== FEW-SHOT EXAMPLE ===\n\n")
-	b.WriteString("[User]: Analyze the data and list files.\n\n")
-	b.WriteString("[Assistant]:\n")
-	for _, tool := range selected {
-		obfuscatedName := obf(tool.Function.Name)
-		input := buildExampleInput(tool.Function.Parameters)
-		b.WriteString(fmt.Sprintf("##TOOL_CALL##\n{\"name\": \"%s\", \"input\": %s}\n##END_CALL##\n", obfuscatedName, input))
-	}
-	b.WriteString("\n[Tool Results]\n")
-	for _, tool := range selected {
-		obfuscatedName := obf(tool.Function.Name)
-		result := buildExampleResult(tool.Function.Name)
-		b.WriteString(fmt.Sprintf("[%s Result]: %s\n", obfuscatedName, result))
-	}
-	b.WriteString("\n[Assistant]: Based on the results, here is my analysis.\n")
-	return b.String()
-}
-
-func (e *ToolCallEngine) obfuscateBareNames(text string) string {
-	if text == "" || e.config.ObfuscateName == nil {
-		return text
-	}
-	return ObfuscateBareNames(text)
+// ObfuscateName applies the engine's configured tool name obfuscation.
+// This is used by providers to re-obfuscate tool names in conversation history
+// before sending to the model.
+func (e *ToolCallEngine) ObfuscateName(name string) string {
+	return e.config.ObfuscateName(name)
 }
 
 func (e *ToolCallEngine) cleanMarkerText(text string) string {

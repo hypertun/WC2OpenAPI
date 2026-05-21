@@ -34,6 +34,25 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req *providers.ChatRe
 }
 
 func (c *Client) chatWithRetry(ctx context.Context, req *providers.ChatRequest, retryCount int) (*providers.ChatResponse, error) {
+	// Pre-check: if message size exceeds limit, split proactively
+	querySize := qwenEstimate(req.Messages, req.Tools)
+	maxChars := c.maxQueryChars()
+	if querySize > maxChars {
+		slog.Info("Qwen: proactively splitting long message",
+			"query_size", querySize,
+			"max_chars", maxChars,
+		)
+		return providers.SplitAndSend(ctx, c.sendDirect, req, maxChars, qwenEstimate)
+	}
+
+	return c.sendDirect(ctx, req, retryCount)
+}
+
+// sendDirect performs a single chat completion without the size-check guard.
+// This is the raw send path used by SplitAndSend to avoid infinite recursion:
+// chatWithRetry → SplitAndSend → sendDirect (stops here, no re-check).
+// It still handles tool-call validation errors with retry.
+func (c *Client) sendDirect(ctx context.Context, req *providers.ChatRequest, retryCount int) (*providers.ChatResponse, error) {
 	reqID := getReqID(ctx)
 	start := time.Now()
 
@@ -91,17 +110,17 @@ func (c *Client) chatWithRetry(ctx context.Context, req *providers.ChatRequest, 
 	}
 
 	// Parse SSE content
-	content, reasoningContent, toolCalls, parseErrors, responseFID := parseSSEContent(string(body), req.Tools)
+	content, reasoningContent, toolCalls, parseErrors, responseFID := c.parseSSEContent(string(body), req.Tools)
 
 	// Retry on invalid tool calls
-	validationErrors := validateToolCallsWithErrors(toolCalls, req.Tools)
+	validationErrors := c.toolEngine.Validate(toolCalls, req.Tools)
 	// Additional tool-specific errors (e.g., Agent subagent_type)
 	agentErrors := validateAgentSubagentType(toolCalls)
 	validationErrors = append(validationErrors, agentErrors...)
 	validationErrors = append(validationErrors, parseErrors...)
-	if toolcall.ShouldRetry(validationErrors, retryCount, maxToolCallRetries) {
-		feedback := toolcall.GenerateToolCallErrorFeedback(validationErrors)
-		backoff := toolcall.CalculateBackoff(retryCount)
+	if c.toolEngine.ShouldRetry(validationErrors, retryCount) {
+		feedback := c.toolEngine.GenerateErrorFeedback(validationErrors)
+		backoff := c.toolEngine.CalculateBackoff(retryCount)
 
 		slog.Info("Retrying chat completion with error feedback",
 			"request_id", reqID,
@@ -114,8 +133,8 @@ func (c *Client) chatWithRetry(ctx context.Context, req *providers.ChatRequest, 
 
 		time.Sleep(backoff)
 
-		retryReq := toolcall.BuildRetryRequest(req, feedback)
-		return c.chatWithRetry(ctx, retryReq, retryCount+1)
+		retryReq := c.toolEngine.BuildRetryRequest(req, feedback)
+		return c.sendDirect(ctx, retryReq, retryCount+1)
 	}
 
 	// Log retry outcome
@@ -180,7 +199,7 @@ func (c *Client) chatWithRetry(ctx context.Context, req *providers.ChatRequest, 
 
 // parseSSEContent extracts content from SSE response
 // Returns content, reasoningContent, tool calls, parse errors, and response message FID
-func parseSSEContent(sseBody string, tools []providers.Tool) (string, string, []providers.ToolCall, []*toolcall.ValidationError, string) {
+func (c *Client) parseSSEContent(sseBody string, tools []providers.Tool) (string, string, []providers.ToolCall, []*toolcall.ValidationError, string) {
 	lines := strings.Split(sseBody, "\n")
 	var content, reasoning strings.Builder
 	var allToolCalls []providers.ToolCall
@@ -243,7 +262,7 @@ func parseSSEContent(sseBody string, tools []providers.Tool) (string, string, []
 	fullText := strings.TrimSpace(content.String() + reasoning.String())
 
 	// Check for ##TOOL_CALL## markers in the full text
-	toolCalls, parseErrors := parseToolCallsFromText(fullText, tools)
+	toolCalls, _, parseErrors := c.toolEngine.Parse(fullText, tools)
 
 	if len(toolCalls) > 0 || len(parseErrors) > 0 {
 		if len(toolCalls) > 0 {
@@ -268,9 +287,6 @@ func (c *Client) CreateChatCompletionStream(ctx context.Context, req *providers.
 }
 
 func (c *Client) streamWithRetry(ctx context.Context, req *providers.ChatRequest, retryCount int) (<-chan providers.StreamResponse, error) {
-	reqID := getReqID(ctx)
-	streamStart := time.Now()
-
 	// Check if we need to refresh token
 	if err := c.ensureAuthenticated(); err != nil {
 		return nil, fmt.Errorf("failed to refresh token: %w", err)
@@ -288,14 +304,11 @@ func (c *Client) streamWithRetry(ctx context.Context, req *providers.ChatRequest
 		}
 	}
 
-	// Create response channel
+	// Create response channel and stream adapter
 	outChan := make(chan providers.StreamResponse, 10)
-
-	needBuffer := len(req.Tools) > 0
 
 	go func() {
 		defer close(outChan)
-		validationStart := time.Now()
 
 		// Build request payload
 		payload := c.convertRequest(chatID, req)
@@ -303,15 +316,8 @@ func (c *Client) streamWithRetry(ctx context.Context, req *providers.ChatRequest
 		httpReq, err := http.NewRequestWithContext(ctx, "POST", c.config.BaseURL+completionURL+"?chat_id="+chatID, bytes.NewReader(payload))
 		if err != nil {
 			outChan <- providers.StreamResponse{
-				ID:     "",
-				Object: "error",
-				Model:  req.Model,
-				Choices: []providers.StreamChoice{
-					{
-						Index: 0,
-						Delta: providers.Delta{Content: "Failed to create request"},
-					},
-				},
+				ID: "", Object: "error", Model: req.Model,
+				Choices: []providers.StreamChoice{{Index: 0, Delta: providers.Delta{Content: "Failed to create request"}}},
 			}
 			return
 		}
@@ -328,15 +334,8 @@ func (c *Client) streamWithRetry(ctx context.Context, req *providers.ChatRequest
 		resp, err := c.httpClient.Do(httpReq)
 		if err != nil {
 			outChan <- providers.StreamResponse{
-				ID:     "",
-				Object: "error",
-				Model:  req.Model,
-				Choices: []providers.StreamChoice{
-					{
-						Index: 0,
-						Delta: providers.Delta{Content: "Request failed"},
-					},
-				},
+				ID: "", Object: "error", Model: req.Model,
+				Choices: []providers.StreamChoice{{Index: 0, Delta: providers.Delta{Content: "Request failed"}}},
 			}
 			return
 		}
@@ -344,15 +343,8 @@ func (c *Client) streamWithRetry(ctx context.Context, req *providers.ChatRequest
 
 		if resp.StatusCode != 200 {
 			outChan <- providers.StreamResponse{
-				ID:     "",
-				Object: "error",
-				Model:  req.Model,
-				Choices: []providers.StreamChoice{
-					{
-						Index: 0,
-						Delta: providers.Delta{Content: fmt.Sprintf("Request failed with status %d", resp.StatusCode)},
-					},
-				},
+				ID: "", Object: "error", Model: req.Model,
+				Choices: []providers.StreamChoice{{Index: 0, Delta: providers.Delta{Content: fmt.Sprintf("Request failed with status %d", resp.StatusCode)}}},
 			}
 			return
 		}
@@ -361,8 +353,15 @@ func (c *Client) streamWithRetry(ctx context.Context, req *providers.ChatRequest
 		msgID := generateMessageID()
 		created := time.Now().Unix()
 
-		var contentBuffer strings.Builder
-		var allChunks []string
+		// Create adapter for real-time streaming with tool call separation.
+		adapter := toolcall.NewStreamSieveAdapter(c.toolEngine, req.Tools, msgID, req.Model, created)
+		if len(req.Tools) > 0 {
+			adapter.WithRetry(ctx, func(ctx2 context.Context, req2 *providers.ChatRequest, rc int) (<-chan providers.StreamResponse, error) {
+				return c.streamWithRetry(ctx2, req2, rc)
+			}, req, retryCount)
+			adapter.ValidateExtra = validateAgentSubagentType
+		}
+
 		var responseFID string
 
 		for {
@@ -416,104 +415,24 @@ func (c *Client) streamWithRetry(ctx context.Context, req *providers.ChatRequest
 			phase := delta.Phase
 			contentStr := delta.Content
 
+			// Feed all content through the adapter — text streams immediately,
+			// tool call markers are captured for final parsing.
 			switch phase {
 			case "think", "thinking_summary":
-				contentBuffer.WriteString(contentStr)
-				if !needBuffer {
-					outChan <- providers.StreamResponse{
-						ID:      msgID,
-						Object:  "chat.completion.chunk",
-						Created: created,
-						Model:   req.Model,
-						Choices: []providers.StreamChoice{
-							{
-								Index: 0,
-								Delta: providers.Delta{ReasoningContent: contentStr},
-							},
-						},
-					}
-				} else {
-					allChunks = append(allChunks, contentStr)
-				}
-			case "tool_call":
-				contentBuffer.WriteString(contentStr)
-			default:
-				if contentStr != "" {
-					contentBuffer.WriteString(contentStr)
-					if !needBuffer {
-						outChan <- providers.StreamResponse{
-							ID:      msgID,
-							Object:  "chat.completion.chunk",
-							Created: created,
-							Model:   req.Model,
-							Choices: []providers.StreamChoice{
-								{
-									Index: 0,
-									Delta: providers.Delta{Content: contentStr},
-								},
-							},
-						}
-					} else {
-						allChunks = append(allChunks, contentStr)
-					}
-				}
-			}
-		}
-
-		fullText := contentBuffer.String()
-
-		toolCalls, parseErrors := parseToolCallsFromText(fullText, req.Tools)
-
-		// Log original tool call structure
-		if len(toolCalls) > 0 {
-			toolNames := make([]string, len(toolCalls))
-			for i, tc := range toolCalls {
-				toolNames[i] = tc.Function.Name
-			}
-			slog.Info("Tool calls received",
-				"request_id", reqID,
-				"count", len(toolCalls),
-				"tools", toolNames,
-			)
-		}
-
-		validationErrors := validateToolCallsWithErrors(toolCalls, req.Tools)
-		// Additional tool-specific errors (e.g., Agent subagent_type)
-		agentErrors := validateAgentSubagentType(toolCalls)
-		validationErrors = append(validationErrors, agentErrors...)
-		validationErrors = append(validationErrors, parseErrors...)
-		if toolcall.ShouldRetry(validationErrors, retryCount, maxToolCallRetries) {
-			feedback := toolcall.GenerateToolCallErrorFeedback(validationErrors)
-			backoff := toolcall.CalculateBackoff(retryCount)
-
-			slog.Info("Retrying stream with error feedback",
-				"request_id", reqID,
-				"retry", retryCount+1,
-				"max", maxToolCallRetries,
-				"errors", len(validationErrors),
-				"validation_errors", validationErrors,
-				"backoff_ms", backoff.Milliseconds(),
-			)
-
-			time.Sleep(backoff)
-
-			retryReq := toolcall.BuildRetryRequest(req, feedback)
-			retryChan, retryErr := c.streamWithRetry(ctx, retryReq, retryCount+1)
-			if retryErr == nil {
-				slog.Info("Stream retry succeeded",
-					"request_id", reqID,
-					"attempts", retryCount+1,
-					"duration_ms", time.Since(streamStart).Milliseconds(),
-				)
-				for chunk := range retryChan {
+				for _, chunk := range adapter.FeedThinking(contentStr) {
 					outChan <- chunk
 				}
-				return
+			case "tool_call":
+				for _, chunk := range adapter.FeedText(contentStr) {
+					outChan <- chunk
+				}
+			default:
+				if contentStr != "" {
+					for _, chunk := range adapter.FeedText(contentStr) {
+						outChan <- chunk
+					}
+				}
 			}
-			slog.Error("Retry failed, falling back",
-				"request_id", reqID,
-				"error", retryErr,
-			)
 		}
 
 		// Store response FID for conversation continuity
@@ -523,93 +442,9 @@ func (c *Client) streamWithRetry(ctx context.Context, req *providers.ChatRequest
 			c.responseIDMu.Unlock()
 		}
 
-		// Log performance metrics
-		if retryCount > 0 || len(toolCalls) > 0 {
-			slog.Info("Tool call metrics",
-				"request_id", reqID,
-				"validation_ms", time.Since(validationStart).Milliseconds(),
-				"retry_count", retryCount,
-				"total_ms", time.Since(streamStart).Milliseconds(),
-				"first_attempt_success", retryCount == 0,
-			)
-		}
-
-		// Send response: tool call chunks take priority over content replay
-		if len(toolCalls) > 0 {
-			// Set index on each tool call (required for streaming delta format)
-			toolCallsWithIndex := make([]providers.ToolCall, len(toolCalls))
-			for i := range toolCalls {
-				idx := i
-				toolCallsWithIndex[i] = toolCalls[i]
-				toolCallsWithIndex[i].Index = &idx
-			}
-
-			// First chunk: role + tool_calls with all data
-			outChan <- providers.StreamResponse{
-				ID:      msgID,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   req.Model,
-				Choices: []providers.StreamChoice{
-					{
-						Index: 0,
-						Delta: providers.Delta{
-							Role:      "assistant",
-							ToolCalls: toolCallsWithIndex,
-						},
-					},
-				},
-			}
-
-			// Final empty chunk with finish_reason
-			finishReason := "tool_calls"
-			outChan <- providers.StreamResponse{
-				ID:      msgID,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   req.Model,
-				Choices: []providers.StreamChoice{
-					{Index: 0, Delta: providers.Delta{}, FinishReason: &finishReason},
-				},
-			}
-		} else if needBuffer {
-			// Tools present but no tool call detected — replay buffered content
-			for _, chunk := range allChunks {
-				outChan <- providers.StreamResponse{
-					ID:      msgID,
-					Object:  "chat.completion.chunk",
-					Created: created,
-					Model:   req.Model,
-					Choices: []providers.StreamChoice{
-						{
-							Index: 0,
-							Delta: providers.Delta{Content: chunk},
-						},
-					},
-				}
-			}
-			finishReason := "stop"
-			outChan <- providers.StreamResponse{
-				ID:      msgID,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   req.Model,
-				Choices: []providers.StreamChoice{
-					{Index: 0, Delta: providers.Delta{}, FinishReason: &finishReason},
-				},
-			}
-		} else {
-			// No tool calls, content already streamed (or empty)
-			finishReason := "stop"
-			outChan <- providers.StreamResponse{
-				ID:      msgID,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   req.Model,
-				Choices: []providers.StreamChoice{
-					{Index: 0, Delta: providers.Delta{}, FinishReason: &finishReason},
-				},
-			}
+		// Flush adapter: handles parsing, validation, optional retry, and final chunks.
+		for _, chunk := range adapter.Flush() {
+			outChan <- chunk
 		}
 	}()
 
@@ -625,7 +460,7 @@ func (c *Client) convertRequest(chatID string, req *providers.ChatRequest) []byt
 	// Format messages to prompt string
 	messages := req.Messages
 	if len(req.Tools) > 0 {
-		messages = injectToolPrompt(req.Messages, req.Tools, req.ToolChoice)
+		messages = c.toolEngine.InjectTools(req.Messages, req.Tools, req.ToolChoice)
 	}
 
 	// Format messages into Qwen's expected format
@@ -731,7 +566,7 @@ func (c *Client) formatMessagesToPrompt(messages []providers.Message) string {
 				for _, tc := range msg.ToolCalls {
 					toolCallParts = append(toolCallParts, fmt.Sprintf(
 						"##TOOL_CALL##\n{\"name\": \"%s\", \"input\": %s}\n##END_CALL##",
-						toQwenName(tc.Function.Name),
+						c.toolEngine.ObfuscateName(tc.Function.Name),
 						tc.Function.Arguments,
 					))
 				}
@@ -842,4 +677,70 @@ func (c *Client) createChatSession(projectID string) (string, error) {
 	}
 
 	return result.Data.ID, nil
+}
+
+const defaultQwenMaxQueryChars = 12000
+
+// maxQueryChars returns the configured max query character limit, or the default.
+func (c *Client) maxQueryChars() int {
+	if c.config.MaxQueryChars > 0 {
+		return c.config.MaxQueryChars
+	}
+	return defaultQwenMaxQueryChars
+}
+
+// qwenEstimate is a provider-specific estimator for Qwen's query size,
+// accounting for the message format (Human:/Assistant:/System:) and tool prompt.
+func qwenEstimate(messages []providers.Message, tools []providers.Tool) int {
+	var b strings.Builder
+	for _, msg := range messages {
+		switch msg.Role {
+		case "system":
+			b.WriteString("System: ")
+		case "user":
+			b.WriteString("Human: ")
+		case "assistant":
+			b.WriteString("Assistant: ")
+			if len(msg.ToolCalls) > 0 {
+				// Assistant with tool calls: write content, then tool calls joined by \n
+				b.WriteString(string(msg.Content))
+				for _, tc := range msg.ToolCalls {
+					b.WriteString(fmt.Sprintf("\n##TOOL_CALL##\n{\"name\": \"%s\", \"input\": %s}\n##END_CALL##",
+						tc.Function.Name, tc.Function.Arguments))
+				}
+				b.WriteString("\n")
+				continue
+			}
+		case "tool":
+			b.WriteString("Tool Result: ")
+		}
+		b.WriteString(string(msg.Content))
+		b.WriteString("\n")
+	}
+
+	// Add tool prompt size if tools present
+	toolPromptSize := 0
+	if len(tools) > 0 {
+		// Rough estimate of tool prompt overhead
+		var tb strings.Builder
+		tb.WriteString("You have access to the following actions:\n\n")
+		for _, t := range tools {
+			if t.Type == "function" && t.Function.Name != "" {
+				tb.WriteString("  - ")
+				tb.WriteString(t.Function.Name)
+				if t.Function.Description != "" {
+					tb.WriteString(": ")
+					tb.WriteString(t.Function.Description)
+				}
+				tb.WriteString("\n")
+			}
+		}
+		// Add rough overhead for few-shot example if tools present
+		if len(tools) > 0 {
+			tb.WriteString("\n=== FEW-SHOT EXAMPLE ===\n...\n")
+		}
+		toolPromptSize = tb.Len()
+	}
+
+	return b.Len() + toolPromptSize
 }

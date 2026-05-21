@@ -101,7 +101,7 @@ func TestToolDescriptionWithHints(t *testing.T) {
 	if !strings.Contains(desc, "Read") {
 		t.Error("expected tool name")
 	}
-	if !strings.Contains(desc, "file_path: string (required)") {
+	if !strings.Contains(desc, "file_path!: string") {
 		t.Error("expected parameter hint")
 	}
 	if !strings.Contains(desc, "reads file contents") {
@@ -109,50 +109,29 @@ func TestToolDescriptionWithHints(t *testing.T) {
 	}
 }
 
-func TestBuildToolCallInstructions_NoTools(t *testing.T) {
-	instructions := BuildToolCallInstructions(nil)
-	if !strings.Contains(instructions, "TOOL CALL FORMAT") {
-		t.Error("expected format instructions even with no tools")
-	}
-}
-
-func TestBuildQwenToolCallInstructions_NoTools(t *testing.T) {
-	instructions := BuildQwenToolCallInstructions(nil)
+func TestBuildMarkerPrompt_NoTools(t *testing.T) {
+	instructions := BuildMarkerPrompt(nil, false)
 	if !strings.Contains(instructions, "ACTION MARKER PROTOCOL") {
 		t.Error("expected protocol instructions even with no tools")
 	}
-}
-
-func TestBuildToolCallInstructions_Content(t *testing.T) {
-	tools := []providers.Tool{
-		makeTool("Read", "", map[string]interface{}{"file_path": map[string]interface{}{"type": "string"}}, []interface{}{"file_path"}),
-		makeTool("Write", "", map[string]interface{}{"file_path": map[string]interface{}{"type": "string"}, "content": map[string]interface{}{"type": "string"}}, []interface{}{"file_path", "content"}),
-	}
-
-	instructions := BuildToolCallInstructions(tools)
-
-	sections := []string{
-		"TOOL CALL FORMAT",
-		"AVAILABLE TOOLS",
-		"CORRECT EXAMPLE",
-		"RULES",
-		"COMMON MISTAKES",
-		"file_path: string (required)",
-		"content: string (required)",
-	}
-	for _, s := range sections {
-		if !strings.Contains(instructions, s) {
-			t.Errorf("expected instructions to contain %q", s)
-		}
+	if strings.Contains(instructions, "you may also output XML") {
+		t.Error("expected no flexibility note when includeFlexibilityNote=false")
 	}
 }
 
-func TestBuildQwenToolCallInstructions_Content(t *testing.T) {
+func TestBuildMarkerPrompt_WithFlexibilityNote_NoTools(t *testing.T) {
+	instructions := BuildMarkerPrompt(nil, true)
+	if !strings.Contains(instructions, "you may also output XML") {
+		t.Error("expected flexibility note when includeFlexibilityNote=true")
+	}
+}
+
+func TestBuildMarkerPrompt_Content(t *testing.T) {
 	tools := []providers.Tool{
 		makeTool("Bash", "run shell command", map[string]interface{}{"command": map[string]interface{}{"type": "string"}}, []interface{}{"command"}),
 	}
 
-	instructions := BuildQwenToolCallInstructions(tools)
+	instructions := BuildMarkerPrompt(tools, false)
 
 	sections := []string{
 		"ACTION MARKER PROTOCOL",
@@ -161,21 +140,24 @@ func TestBuildQwenToolCallInstructions_Content(t *testing.T) {
 		"STRICT RULES",
 		"VALIDATION CHECKLIST",
 		"COMMON MISTAKES",
-		"command: string (required)",
+		"command!: string",
 	}
 	for _, s := range sections {
 		if !strings.Contains(instructions, s) {
 			t.Errorf("expected instructions to contain %q", s)
 		}
 	}
+	if strings.Contains(instructions, "you may also output XML") {
+		t.Error("expected no flexibility note when includeFlexibilityNote=false")
+	}
 }
 
-func TestBuildQwenToolCallInstructions_ValidationChecklist(t *testing.T) {
+func TestBuildMarkerPrompt_ValidationChecklist(t *testing.T) {
 	tools := []providers.Tool{
 		makeTool("Read", "", map[string]interface{}{"file_path": map[string]interface{}{"type": "string"}}, []interface{}{"file_path"}),
 	}
 
-	instructions := BuildQwenToolCallInstructions(tools)
+	instructions := BuildMarkerPrompt(tools, false)
 
 	checklistItems := []string{
 		"required parameters are present",
@@ -190,12 +172,12 @@ func TestBuildQwenToolCallInstructions_ValidationChecklist(t *testing.T) {
 	}
 }
 
-func TestBuildQwenToolCallInstructions_NegativeExamples(t *testing.T) {
+func TestBuildMarkerPrompt_NegativeExamples(t *testing.T) {
 	tools := []providers.Tool{
 		makeTool("Read", "", map[string]interface{}{"file_path": map[string]interface{}{"type": "string"}}, []interface{}{"file_path"}),
 	}
 
-	instructions := BuildQwenToolCallInstructions(tools)
+	instructions := BuildMarkerPrompt(tools, false)
 
 	negatives := []string{"Wrong:", "not"}
 	for _, n := range negatives {

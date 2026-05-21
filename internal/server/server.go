@@ -18,6 +18,7 @@ import (
 	"github.com/user/wc2api/internal/providers/mimo"
 	"github.com/user/wc2api/internal/providers/qwen"
 	"github.com/user/wc2api/internal/providers/qwencn"
+	"github.com/user/wc2api/internal/providers/stepfun"
 	serverMiddleware "github.com/user/wc2api/internal/server/middleware"
 )
 
@@ -33,8 +34,8 @@ type Server struct {
 // New creates a new server instance
 func New(cfg *config.Config) (*Server, error) {
 	s := &Server{
-		config:   cfg,
-		router:   chi.NewRouter(),
+		config:    cfg,
+		router:    chi.NewRouter(),
 		providers: []providers.Provider{},
 	}
 
@@ -66,6 +67,16 @@ func New(cfg *config.Config) (*Server, error) {
 		if err != nil {
 			slog.Error("failed to create mimo provider", "error", err)
 			errors = append(errors, fmt.Errorf("failed to create mimo provider: %w", err))
+		} else {
+			s.providers = append(s.providers, prov)
+		}
+	}
+
+	if cfg.Provider.StepFun.Enabled {
+		prov, err := stepfun.New(cfg.Provider.StepFun)
+		if err != nil {
+			slog.Error("failed to create stepfun provider", "error", err)
+			errors = append(errors, fmt.Errorf("failed to create stepfun provider: %w", err))
 		} else {
 			s.providers = append(s.providers, prov)
 		}
@@ -159,8 +170,9 @@ func (s *Server) setupMiddleware() {
 	// CORS
 	s.router.Use(serverMiddleware.CORS())
 
-	// Request timeout
-	s.router.Use(middleware.Timeout(time.Duration(s.config.Server.WriteTimeout) * time.Second))
+	// Note: Request timeout is NOT applied globally.
+	// Streaming endpoints (chat completions with stream=true) can run for extended periods.
+	// The HTTP server's WriteTimeout is still in effect and can be increased for streaming workloads.
 }
 
 // setupRoutes configures all routes

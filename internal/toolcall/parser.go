@@ -101,13 +101,11 @@ func ParseToolCallsFromText(text string, tools []providers.Tool) ([]providers.To
 	// Try parsing from original text first
 	if sawMarkers {
 		if calls, errs := parseToolCallMarkers(text); len(calls) > 0 {
-			ValidateToolCalls(calls, tools)
 			return calls, errs
 		} else {
 			allParseErrors = append(allParseErrors, errs...)
 		}
 		if calls, errs := parseToolCallFallback(text); len(calls) > 0 {
-			ValidateToolCalls(calls, tools)
 			return calls, errs
 		} else {
 			allParseErrors = append(allParseErrors, errs...)
@@ -131,7 +129,6 @@ func ParseToolCallsFromText(text string, tools []providers.Tool) ([]providers.To
 	toolCalls, errs := parseToolCallMarkers(normalized)
 	allParseErrors = append(allParseErrors, errs...)
 	if len(toolCalls) > 0 {
-		ValidateToolCalls(toolCalls, tools)
 		return toolCalls, allParseErrors
 	}
 
@@ -139,7 +136,6 @@ func ParseToolCallsFromText(text string, tools []providers.Tool) ([]providers.To
 	toolCalls, errs = parseToolCallFallback(normalized)
 	allParseErrors = append(allParseErrors, errs...)
 	if len(toolCalls) > 0 {
-		ValidateToolCalls(toolCalls, tools)
 		return toolCalls, allParseErrors
 	}
 
@@ -175,18 +171,42 @@ func parseToolCallMarkers(text string) ([]providers.ToolCall, []*ValidationError
 	var calls []providers.ToolCall
 	var parseErrors []*ValidationError
 
-	markerPattern := regexp.MustCompile(`(?s)##TOOL_CALL##\s*(.+?)\s*##END_CALL##`)
-	matches := markerPattern.FindAllStringSubmatch(text, -1)
+	// Use last-##TOOL_CALL##-before-##END_CALL## lookup instead of a regex
+	// with lazy matching. This avoids capturing model explanation text when
+	// the model emits a stray ##TOOL_CALL## marker in its thinking before the
+	// actual tool call block (e.g. "##TOOL_CALL##\nI'll fix...\n\n##TOOL_CALL##{...}##END_CALL##").
+	const startMarker = "##TOOL_CALL##"
+	const endMarker = "##END_CALL##"
 
-	for i, match := range matches {
-		if len(match) < 2 {
+	searchPos := 0
+	for {
+		endPos := strings.Index(text[searchPos:], endMarker)
+		if endPos < 0 {
+			break
+		}
+		absEndPos := searchPos + endPos
+
+		// Find the last ##TOOL_CALL## before this ##END_CALL##
+		startPos := strings.LastIndex(text[:absEndPos], startMarker)
+		if startPos < 0 {
+			searchPos = absEndPos + len(endMarker)
 			continue
 		}
-		jsonStr := strings.TrimSpace(match[1])
+
+		jsonStr := strings.TrimSpace(text[startPos+len(startMarker) : absEndPos])
 
 		var toolData struct {
 			Name  string         `json:"name"`
 			Input map[string]any `json:"input"`
+		}
+
+		// Guard: valid tool call JSON always starts with '{'. If it doesn't,
+		// the text between the markers is prose (e.g. the model describing the
+		// format), not an actual call — skip silently at DEBUG level.
+		if !strings.HasPrefix(jsonStr, "{") {
+			slog.Debug("Skipping non-JSON content between tool call markers", "preview", truncate(jsonStr, 80))
+			searchPos = absEndPos + len(endMarker)
+			continue
 		}
 
 		err := json.Unmarshal([]byte(jsonStr), &toolData)
@@ -204,6 +224,7 @@ func parseToolCallMarkers(text string) ([]providers.ToolCall, []*ValidationError
 				Actual:    truncate(jsonStr, 200),
 				Severity:  "error",
 			})
+			searchPos = absEndPos + len(endMarker)
 			continue
 		}
 
@@ -212,17 +233,20 @@ func parseToolCallMarkers(text string) ([]providers.ToolCall, []*ValidationError
 		argsJSON, err := json.Marshal(toolData.Input)
 		if err != nil {
 			slog.Warn("Failed to marshal tool call input", "error", err)
+			searchPos = absEndPos + len(endMarker)
 			continue
 		}
 
 		calls = append(calls, providers.ToolCall{
-			ID:   fmt.Sprintf("call_%d", i),
+			ID:   fmt.Sprintf("call_%d", len(calls)),
 			Type: "function",
 			Function: providers.ToolCallFunction{
 				Name:      toolData.Name,
 				Arguments: string(argsJSON),
 			},
 		})
+
+		searchPos = absEndPos + len(endMarker)
 	}
 
 	return calls, parseErrors
@@ -509,6 +533,22 @@ func extractXMLToolCallSingular(text string, toolNames []string) []providers.Too
 			}
 
 			funcBody = extractCDATAInner(funcBody)
+			
+			// Try to extract XML parameters first (e.g., <parameter=key>value</parameter>)
+			xmlParams := extractXMLParameters(funcBody)
+			if len(xmlParams) > 0 {
+				argsJSON, _ := json.Marshal(xmlParams)
+				calls = append(calls, providers.ToolCall{
+					ID:   fmt.Sprintf("call_%d", len(calls)),
+					Type: "function",
+					Function: providers.ToolCallFunction{
+						Name:      resolvedName,
+						Arguments: string(argsJSON),
+					},
+				})
+				continue
+			}
+			
 			var jsonVal interface{}
 			if json.Unmarshal([]byte(funcBody), &jsonVal) == nil {
 				switch v := jsonVal.(type) {
@@ -626,52 +666,6 @@ func NormalizeFragmentedToolCall(text string) string {
 	}
 
 	return normalized
-}
-
-// --- Validation ---
-
-// ValidateToolCalls validates all tool calls against provided tool definitions (no-error variant).
-func ValidateToolCalls(calls []providers.ToolCall, tools []providers.Tool) {
-	if tools == nil {
-		return
-	}
-	for _, call := range calls {
-		var args map[string]any
-		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
-			continue
-		}
-		ValidateSingleToolCall(call.Function.Name, args, tools)
-	}
-}
-
-
-
-// ValidateSingleToolCall validates a single tool call.
-func ValidateSingleToolCall(name string, input map[string]any, tools []providers.Tool) {
-	var toolDef *providers.Tool
-	for _, t := range tools {
-		if t.Function.Name == name {
-			toolDef = &t
-			break
-		}
-	}
-	if toolDef == nil {
-		return
-	}
-	if toolDef.Function.Parameters == nil {
-		return
-	}
-	schemaJSON, err := json.Marshal(toolDef.Function.Parameters)
-	if err != nil {
-		slog.Warn("Failed to marshal tool schema", "tool", name, "error", err)
-		return
-	}
-	result := ValidateToolCall(name, input, string(schemaJSON))
-	slog.Info("Validation result",
-		"tool", name,
-		"valid", !result.HasErrors(),
-		"error_count", len(result.Errors),
-		"errors", result.Errors)
 }
 
 // --- Repair / fix functions ---
@@ -802,7 +796,7 @@ func applyToolSpecificFixes(name string, fixed map[string]any) map[string]any {
 	nameLower := strings.ToLower(name)
 
 	switch nameLower {
-	case "askuserquestion":
+	case "askuserquestion", "question":
 		if question, ok := fixed["question"]; ok && fixed["questions"] == nil {
 			fixed["questions"] = []any{
 				map[string]any{
@@ -816,7 +810,27 @@ func applyToolSpecificFixes(name string, fixed map[string]any) map[string]any {
 				},
 			}
 			delete(fixed, "question")
-			slog.Debug("Fixed AskUserQuestion: converted 'question' to 'questions' array")
+			slog.Debug("Fixed Question: converted 'question' to 'questions' array")
+		}
+		// If the model passed flat params (header, question, options) outside the questions array, wrap them
+		if fixed["questions"] == nil {
+			if _, hasHeader := fixed["header"]; hasHeader {
+				q := map[string]any{
+					"header":      fixed["header"],
+					"multiSelect": false,
+				}
+				if qText, ok := fixed["question_text"]; ok {
+					q["question"] = qText
+					delete(fixed, "question_text")
+				}
+				if opts, ok := fixed["options"]; ok {
+					q["options"] = opts
+					delete(fixed, "options")
+				}
+				delete(fixed, "header")
+				fixed["questions"] = []any{q}
+				slog.Debug("Fixed Question: wrapped flat params into questions array")
+			}
 		}
 		if questions, ok := fixed["questions"].([]any); ok {
 			for _, q := range questions {
@@ -854,6 +868,17 @@ func applyToolSpecificFixes(name string, fixed map[string]any) map[string]any {
 		if script, ok := fixed["script"]; ok {
 			fixed["command"] = script
 			delete(fixed, "script")
+		}
+		// Coerce command from []any to a joined string
+		if arr, ok := fixed["command"].([]any); ok {
+			parts := make([]string, 0, len(arr))
+			for _, item := range arr {
+				if s, ok := item.(string); ok {
+					parts = append(parts, s)
+				}
+			}
+			fixed["command"] = strings.Join(parts, " && ")
+			slog.Debug("Fixed Bash: joined command array to string")
 		}
 		if fixed["timeout"] == nil {
 			fixed["timeout"] = float64(30000)
@@ -1893,7 +1918,7 @@ func cleanXMLToolText(text string) string {
 	return strings.TrimSpace(text)
 }
 
-func buildExampleInput(params map[string]interface{}) string {
+func BuildExampleInput(params map[string]interface{}) string {
 	if params == nil {
 		return "{}"
 	}
@@ -1950,7 +1975,7 @@ func buildExampleInput(params map[string]interface{}) string {
 	return string(jsonBytes)
 }
 
-func buildExampleResult(toolName string) string {
+func BuildExampleResult(toolName string) string {
 	switch toolName {
 	case "Read":
 		return "<file content here>"

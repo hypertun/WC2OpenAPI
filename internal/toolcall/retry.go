@@ -35,12 +35,30 @@ func CalculateBackoff(retryCount int) time.Duration {
 }
 
 func BuildRetryRequest(original *providers.ChatRequest, feedback string) *providers.ChatRequest {
-	newMessages := make([]providers.Message, len(original.Messages)+1)
-	newMessages[0] = providers.Message{
-		Role:    "system",
-		Content: providers.MessageContent(feedback),
+	newMessages := make([]providers.Message, len(original.Messages))
+	copy(newMessages, original.Messages)
+
+	// Find existing system message and append feedback, or prepend a new one
+	systemFound := false
+	for i, msg := range newMessages {
+		if msg.Role == "system" {
+			// Append feedback to existing system message
+			newMessages[i] = providers.Message{
+				Role:    "system",
+				Content: providers.MessageContent(string(msg.Content) + "\n\n" + feedback),
+			}
+			systemFound = true
+			break
+		}
 	}
-	copy(newMessages[1:], original.Messages)
+
+	// If no system message exists, prepend one
+	if !systemFound {
+		newMessages = append([]providers.Message{{
+			Role:    "system",
+			Content: providers.MessageContent(feedback),
+		}}, newMessages...)
+	}
 
 	return &providers.ChatRequest{
 		Model:       original.Model,

@@ -16,6 +16,7 @@ import (
 
 	"github.com/coocood/freecache"
 	"github.com/user/wc2api/internal/config"
+	"github.com/user/wc2api/internal/toolcall"
 )
 
 const (
@@ -59,6 +60,7 @@ type Client struct {
 	cookieHeader    string
 
 	modelCache *freecache.Cache
+	toolEngine *toolcall.ToolCallEngine
 }
 
 // New creates a new MiMo client
@@ -79,6 +81,7 @@ func New(cfg config.MiMoConfig) (*Client, error) {
 			Timeout: time.Duration(cfg.Timeout) * time.Second,
 		},
 		modelCache: freecache.NewCache(512 * 1024),
+		toolEngine: toolcall.New(toolcall.DefaultConfig()),
 	}, nil
 }
 

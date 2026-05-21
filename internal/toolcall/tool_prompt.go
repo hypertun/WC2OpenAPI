@@ -84,7 +84,7 @@ func compressSchema(schema map[string]interface{}) string {
 	return "{" + strings.Join(paramStrs, ", ") + "}"
 }
 
-// Deprecated: use compressSchema instead. Kept for backward compatibility.
+// Deprecated: use compressSchema instead. Kept for backward compatibility. Will be removed in a future version.
 func buildParameterHints(schema map[string]interface{}) string {
 	if schema == nil {
 		return ""
@@ -134,8 +134,8 @@ func buildParameterHints(schema map[string]interface{}) string {
 func toolDescriptionWithHints(tool providers.Tool) string {
 	name := tool.Function.Name
 	desc := tool.Function.Description
-	// Use parameter hints from schema
-	hints := buildParameterHints(tool.Function.Parameters)
+	// Use parameter schema compression for better hints
+	hints := compressSchema(tool.Function.Parameters)
 
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("  - %s", name))
@@ -148,54 +148,11 @@ func toolDescriptionWithHints(tool providers.Tool) string {
 	return b.String()
 }
 
-// BuildToolCallInstructions generates DSML tool calling instructions
-func BuildToolCallInstructions(tools []providers.Tool) string {
-	var b strings.Builder
-
-	b.WriteString("TOOL CALL FORMAT — FOLLOW EXACTLY:\n\n")
-	b.WriteString("<|DSML|tool_calls>\n")
-	b.WriteString("  <|DSML|invoke name=\"TOOL_NAME_HERE\">\n")
-	b.WriteString("    <|DSML|parameter name=\"PARAMETER_NAME\"><![CDATA[PARAMETER_VALUE]]></|DSML|parameter>\n")
-	b.WriteString("  </|DSML|invoke>\n")
-	b.WriteString("</|DSML|tool_calls>\n\n")
-
-	if len(tools) > 0 {
-		b.WriteString("AVAILABLE TOOLS:\n")
-		for _, tool := range tools {
-			b.WriteString(toolDescriptionWithHints(tool))
-			b.WriteString("\n")
-		}
-		b.WriteString("\n")
-	}
-
-	b.WriteString("CORRECT EXAMPLE:\n")
-	b.WriteString("<|DSML|tool_calls>\n")
-	b.WriteString("  <|DSML|invoke name=\"Read\">\n")
-	b.WriteString("    <|DSML|parameter name=\"file_path\"><![CDATA[/path/to/file]]></|DSML|parameter>\n")
-	b.WriteString("  </|DSML|invoke>\n")
-	b.WriteString("</|DSML|tool_calls>\n\n")
-
-	b.WriteString("RULES:\n")
-	b.WriteString("1) Use the <|DSML|tool_calls> wrapper format.\n")
-	b.WriteString("2) Put tool name in name attribute.\n")
-	b.WriteString("3) All string values must use <![CDATA[...]]>.\n")
-	b.WriteString("4) Do NOT wrap XML in markdown fences.\n")
-	b.WriteString("5) First non-whitespace must be <|DSML|tool_calls|>.\n")
-	b.WriteString("6) Use EXACT parameter names as listed in AVAILABLE TOOLS.\n")
-	b.WriteString("7) Each parameter must match its expected type (strings in CDATA, numbers without quotes).\n\n")
-
-	b.WriteString("COMMON MISTAKES:\n")
-	b.WriteString("- Wrong parameter name: \"path\" instead of \"file_path\"\n")
-	b.WriteString("- Missing required parameters\n")
-	b.WriteString("- Wrong type: \"command\": 123 instead of \"command\": \"ls -la\"\n")
-	b.WriteString("- Extra unknown parameters not listed in AVAILABLE TOOLS\n\n")
-
-	return b.String()
-}
-
-// BuildQwenToolCallInstructions generates Qwen-style tool calling instructions
-// using ##TOOL_CALL## text markers instead of DSML XML format
-func BuildQwenToolCallInstructions(tools []providers.Tool) string {
+// BuildMarkerPrompt generates tool calling instructions using ##TOOL_CALL## text markers.
+// This is the canonical prompt format used by all providers.
+// If includeFlexibilityNote is true, a note is appended telling the LLM that XML formats
+// are also accepted — giving flexibility while preferring the marker format.
+func BuildMarkerPrompt(tools []providers.Tool, includeFlexibilityNote bool) string {
 	var b strings.Builder
 
 	b.WriteString("=== ACTION MARKER PROTOCOL (client-parsed text patterns) ===\n")
@@ -256,6 +213,100 @@ func BuildQwenToolCallInstructions(tools []providers.Tool) string {
 
 	b.WriteString("ONLY ##TOOL_CALL##...##END_CALL## is accepted.\n")
 
+	if includeFlexibilityNote {
+		b.WriteString("\nNOTE: While the ##TOOL_CALL##...##END_CALL## marker format is preferred, you may also output XML tool call formats (<tool_calls>, <|MiMoML|tool_calls>, or <function_calls>) if that feels more natural — the client handles both correctly.\n")
+	}
+
+	return b.String()
+}
+
+// truncateFirstSentence extracts the first sentence from text (up to `.`, `!`, or newline).
+func truncateFirstSentence(s string) string {
+	maxLen := 80
+	for i, c := range s {
+		if c == '.' || c == '!' || c == '\n' {
+			return s[:i+1]
+		}
+		if i >= maxLen {
+			return s[:maxLen]
+		}
+	}
+	if len(s) > maxLen {
+		return s[:maxLen]
+	}
+	return s
+}
+
+// BuildCompactMarkerPrompt generates a compact version of the tool calling instructions.
+// It reduces boilerplate significantly while keeping parameter hints and the format block.
+// Tool descriptions are truncated to their first sentence to save tokens.
+// This is optimized for small-context providers like StepFun.
+func BuildCompactMarkerPrompt(tools []providers.Tool) string {
+	var b strings.Builder
+
+	b.WriteString("Call tools with ##TOOL_CALL## markers.\n")
+	b.WriteString("Format: ##TOOL_CALL##\\n{\"name\": \"TOOL_NAME\", \"input\": {...}}\\n##END_CALL##\n\n")
+
+	b.WriteString("AVAILABLE ACTIONS:\n")
+	for _, tool := range tools {
+		name := tool.Function.Name
+		hints := compressSchema(tool.Function.Parameters)
+
+		b.WriteString("  - " + name)
+		if hints != "" {
+			b.WriteString(fmt.Sprintf("(%s)", hints))
+		}
+		if tool.Function.Description != "" {
+			// Use first sentence only
+			desc := truncateFirstSentence(tool.Function.Description)
+			b.WriteString(fmt.Sprintf(" — %s", desc))
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
+
+	b.WriteString("RULES: Use exact names/params from above. Required params must be present. No preamble before ##TOOL_CALL##. Continue after [Tool Result] until done.\n")
+	b.WriteString("FORBIDDEN: Never claim a tool is unavailable or cannot be invoked.\n")
+
+	return b.String()
+}
+
+// injectFewShotExample generates a few-shot tool call example for up to the first 2 tools.
+// The obfuscator function is applied to tool names in the example output.
+func injectFewShotExample(tools []providers.Tool, obfuscator func(string) string) string {
+	if len(tools) == 0 {
+		return ""
+	}
+	if obfuscator == nil {
+		obfuscator = func(s string) string { return s }
+	}
+	selected := make([]providers.Tool, 0, 2)
+	for _, tool := range tools {
+		selected = append(selected, tool)
+		if len(selected) >= 2 {
+			break
+		}
+	}
+	if len(selected) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("\n=== FEW-SHOT EXAMPLE ===\n\n")
+	b.WriteString("[User]: Analyze the data and list files.\n\n")
+	b.WriteString("[Assistant]:\n")
+	for _, tool := range selected {
+		obfuscatedName := obfuscator(tool.Function.Name)
+		input := BuildExampleInput(tool.Function.Parameters)
+		b.WriteString(fmt.Sprintf("##TOOL_CALL##\n{\"name\": \"%s\", \"input\": %s}\n##END_CALL##\n", obfuscatedName, input))
+	}
+	b.WriteString("\n[Tool Results]\n")
+	for _, tool := range selected {
+		obfuscatedName := obfuscator(tool.Function.Name)
+		result := BuildExampleResult(tool.Function.Name)
+		b.WriteString(fmt.Sprintf("[%s Result]: %s\n", obfuscatedName, result))
+	}
+	b.WriteString("\n[Assistant]: Based on the results, here is my analysis.\n")
 	return b.String()
 }
 

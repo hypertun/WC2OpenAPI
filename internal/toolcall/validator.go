@@ -468,6 +468,35 @@ func GetBuiltInSchema(toolName string) string {
 			"required": ["command"],
 			"additionalProperties": false
 		}`,
+		"question": `{
+			"type": "object",
+			"properties": {
+				"questions": {
+					"type": "array",
+					"items": {
+						"type": "object",
+						"properties": {
+							"question": {"type": "string"},
+							"header": {"type": "string"},
+							"options": {
+								"type": "array",
+								"items": {
+									"type": "object",
+									"properties": {
+										"label": {"type": "string"},
+										"description": {"type": "string"}
+									}
+								}
+							},
+							"multiSelect": {"type": "boolean"}
+						},
+						"required": ["question"]
+					}
+				}
+			},
+			"required": ["questions"],
+			"additionalProperties": false
+		}`,
 		"AskUserQuestion": `{
 			"type": "object",
 			"properties": {

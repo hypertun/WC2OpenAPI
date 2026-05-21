@@ -105,7 +105,7 @@ func TestValidateToolCall_TypeMismatch(t *testing.T) {
 		t.Error("Expected at least one error")
 	} else {
 		msg := result.Errors[0].Message
-		if !contains(msg, "Type mismatch") {
+		if !strings.Contains(msg, "Type mismatch") {
 			t.Errorf("Expected type mismatch error, got: %s", msg)
 		}
 	}
@@ -191,7 +191,7 @@ func TestValidateToolCall_StringConstraints(t *testing.T) {
 				}
 				found := false
 				for _, err := range result.Errors {
-					if contains(err.Message, tt.errMsg) {
+					if strings.Contains(err.Message, tt.errMsg) {
 						found = true
 						break
 					}

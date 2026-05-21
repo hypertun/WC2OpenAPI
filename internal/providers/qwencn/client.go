@@ -3,6 +3,8 @@ package qwencn
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,6 +18,7 @@ import (
 	"github.com/coocood/freecache"
 	"github.com/user/wc2api/internal/config"
 	providers "github.com/user/wc2api/internal/providers"
+	"github.com/user/wc2api/internal/toolcall"
 )
 
 const (
@@ -34,8 +37,9 @@ type Client struct {
 	mu         sync.Mutex
 	sessionIDs map[string]string // reqID -> sessionID for cleanup
 
-	deviceID  string          // generated once, reused for model list API
+	deviceID   string              // generated once, reused for model list API
 	modelCache *freecache.Cache
+	toolEngine *toolcall.ToolCallEngine // unified tool call parsing/validation/retry
 }
 
 // New creates a new Qwen CN client with SSO ticket authentication
@@ -45,17 +49,26 @@ func New(cfg config.QwenCNConfig) (*Client, error) {
 		return nil, fmt.Errorf("invalid base URL: %w", err)
 	}
 
+	// Use ResponseHeaderTimeout instead of Client.Timeout.
+	// Client.Timeout covers the entire HTTP lifecycle including body reads,
+	// which kills long-running SSE streams mid-generation.
+	// ResponseHeaderTimeout only applies to waiting for the initial response headers,
+	// allowing the stream to run as long as data keeps flowing.
+	timeout := time.Duration(cfg.Timeout) * time.Second
 	httpClient := &http.Client{
-		Timeout: time.Duration(cfg.Timeout) * time.Second,
+		Transport: &http.Transport{
+			ResponseHeaderTimeout: timeout,
+		},
 	}
 
 	return &Client{
-		config:     cfg,
-		baseURL:    baseURL,
-		httpClient: httpClient,
-		sessionIDs: make(map[string]string),
-		deviceID:   uuid(),
-		modelCache: freecache.NewCache(512 * 1024),
+		config:      cfg,
+		baseURL:     baseURL,
+		httpClient:  httpClient,
+		sessionIDs:  make(map[string]string),
+		deviceID:    uuid(),
+		modelCache:  freecache.NewCache(512 * 1024),
+		toolEngine:  toolcall.New(toolcall.CompactConfig()),
 	}, nil
 }
 
@@ -93,33 +106,25 @@ func (c *Client) ticketCookie() string {
 
 // uuid generates a UUID v4 string
 func uuid() string {
-	var id [36]byte
-	const hexDigits = "0123456789abcdef"
-	for i := 0; i < 36; i++ {
-		switch i {
-		case 8, 13, 18, 23:
-			id[i] = '-'
-		case 14:
-			id[i] = '4'
-		case 19:
-			id[i] = hexDigits[8+time.Now().UnixNano()%4] // '8','9','a','b'
-		default:
-			id[i] = hexDigits[time.Now().UnixNano()%16]
-			time.Sleep(1) // ensure different values
-		}
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// Fallback if crypto/rand fails (should not happen)
+		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
-	return string(id[:])
+	// Set version (4) and variant bits
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
-// nonce generates a 12-character random string
+// nonce generates a 12-character random hex string
 func nonce() string {
-	const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
-	b := make([]byte, 12)
-	for i := range b {
-		b[i] = chars[time.Now().UnixNano()%int64(len(chars))]
-		time.Sleep(1)
+	b := make([]byte, 6)
+	if _, err := rand.Read(b); err != nil {
+		// Fallback if crypto/rand fails
+		return fmt.Sprintf("%d", time.Now().UnixNano()%281474976710656)[:12]
 	}
-	return string(b)
+	return hex.EncodeToString(b)
 }
 
 // extractTextContent extracts text from a message content that can be string or array
@@ -147,8 +152,39 @@ func extractTextContent(content interface{}) string {
 	}
 }
 
-// doRequest sends a chat request to Qwen CN API and returns the response stream
+// isTransientError returns true for HTTP status codes that are safe to retry.
+func isTransientError(status int) bool {
+	return status == 429 || status == 502 || status == 503 || status == 504
+}
+
+// doRequest sends a chat request to Qwen CN API and returns the response stream.
+// Retries once on transient errors (429, 502, 503, 504).
 func (c *Client) doRequest(ctx context.Context, reqBody map[string]interface{}, reqID string) (*http.Response, error) {
+	const maxAttempts = 2 // initial + 1 retry
+
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		resp, err := c.doRequestOnce(ctx, reqBody, reqID)
+		if err != nil {
+			// Check if the error contains a transient status code
+			var status int
+			if n, scanErr := fmt.Sscanf(err.Error(), "QwenCN API error: status %d", &status); scanErr == nil && n == 1 && isTransientError(status) {
+				lastErr = err
+				backoff := time.Duration(1<<attempt) * time.Second // 1s, 2s
+				slog.Warn("QwenCN: transient error, retrying",
+					"status", status, "attempt", attempt+1, "backoff_ms", backoff.Milliseconds())
+				time.Sleep(backoff)
+				continue
+			}
+			return nil, err
+		}
+		return resp, nil
+	}
+	return nil, fmt.Errorf("QwenCN API: all %d attempts failed, last error: %w", maxAttempts, lastErr)
+}
+
+// doRequestOnce sends a single chat request to Qwen CN API and returns the response stream.
+func (c *Client) doRequestOnce(ctx context.Context, reqBody map[string]interface{}, reqID string) (*http.Response, error) {
 	jsonBody, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)

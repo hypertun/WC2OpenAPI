@@ -224,3 +224,46 @@ type Provider interface {
 	// Close cleans up the provider
 	Close() error
 }
+
+// MessageSizer is an optional interface that providers can implement to provide
+// precise query size estimation for the message splitting logic.
+// If not implemented, the generic EstimateQuerySize is used instead.
+type MessageSizer interface {
+	// EstimateQuerySize returns the approximate character count of the reformatted
+	// messages as they would appear in the provider's wire format.
+	EstimateQuerySize(messages []Message) int
+}
+
+// StreamEvent is a standardized representation of a single streaming event
+// produced when a provider parses its wire-format SSE payload.
+type StreamEvent struct {
+	Content          string     `json:"content,omitempty"`
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
+	Done             bool       `json:"done,omitempty"`
+}
+
+// TransportAdapter defines the provider-specific transport layer that a
+// generic Provider wrapper uses to communicate with the upstream API.
+// Implementing this interface is optional — existing providers may continue
+// to implement the Provider interface directly.
+type TransportAdapter interface {
+	// Name returns the provider name for routing and logging.
+	Name() string
+
+	// ListModels returns the available model identifiers for this provider.
+	ListModels() []Model
+
+	// FormatRequest converts an OpenAI ChatRequest into the provider-specific
+	// HTTP request body and headers. The returned byte slice is used as the
+	// HTTP request body; headers are merged with any provider-level defaults.
+	FormatRequest(ctx context.Context, req *ChatRequest) (body []byte, headers map[string]string, err error)
+
+	// ParseStreamEvent parses a single SSE event payload from the provider's
+	// wire format. When content and reasoning are cumulative across events the
+	// caller tracks deltas. ToolCalls are returned once when fully parsed.
+	ParseStreamEvent(data []byte) (*StreamEvent, error)
+
+	// Close cleans up any provider resources (e.g. browser instances).
+	Close() error
+}
